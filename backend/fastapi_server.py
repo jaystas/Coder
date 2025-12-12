@@ -800,7 +800,7 @@ class LLMService:
                 sentence_tts = SentenceTTS(
                     text=sentence,
                     speaker=character,
-                    voice=voice,
+                    voice=Voice,
                     sentence_index=sentence_index,
                     is_final=False,
                     timestamp=time.time()
@@ -831,9 +831,273 @@ class LLMService:
 ##--           TTS Service          --##
 ########################################
 
+def revert_delay_pattern(data: torch.Tensor, start_idx: int = 0) -> torch.Tensor:
+    """Undo Higgs delay pattern so decoded frames line up."""
+    if data.ndim != 2:
+        raise ValueError('Expected 2D tensor from audio tokenizer')
+    if data.shape[1] - data.shape[0] < start_idx:
+        raise ValueError('Invalid start_idx for delay pattern reversion')
+
+    out = []
+    num_codebooks = data.shape[0]
+    for i in range(num_codebooks):
+        out.append(data[i:(i + 1), i + start_idx:(data.shape[1] - num_codebooks + 1 + i)])
+    return torch.cat(out, dim=0)
+
 class TTSService:
-    """TTS placeholder"""
-    
+    """Higgs Streaming"""
+
+    def __init__(self):
+        self.serve_engine = None
+        self.voice_dir = "/workspace/tts/Code/backend/voices"
+        self.sample_rate = 24000
+        self._initialized = False
+        self._engine_lock = Lock()
+        self._chunk_overlap_duration = 0.04  # 40ms crossfade
+        self._chunk_size = 16  # Tokens per streaming chunk
+        self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def initialize(self):
+        """Initialize Higgs Audio TTS engine"""
+        if self._initialized:
+            return
+
+        logger.info("Initializing Higgs Audio TTS service...")
+
+        try:
+            from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"Using device: {device}")
+
+            self.serve_engine = HiggsAudioServeEngine(
+                model_name_or_path="bosonai/higgs-audio-v2-generation-3B-base",
+                audio_tokenizer_name_or_path="bosonai/higgs-audio-v2-tokenizer",
+                device=device
+            )
+
+            self._initialized = True
+            logger.info("Higgs Audio TTS service initialized successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize Higgs Audio TTS: {e}")
+            raise
+
+    def _load_voice_reference(self, voice_name: str):
+        """Load reference audio and text for voice cloning"""
+        from backend.boson_multimodal.data_types import Message, AudioContent
+
+        audio_path = os.path.join(self.voice_dir, f"{voice_name}.wav")
+        text_path = os.path.join(self.voice_dir, f"{voice_name}.txt")
+
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Voice audio file not found: {audio_path}")
+        if not os.path.exists(text_path):
+            raise FileNotFoundError(f"Voice text file not found: {text_path}")
+
+        with open(text_path, 'r', encoding='utf-8') as f:
+            ref_text = f.read().strip()
+
+        # Build messages with reference audio (few-shot approach)
+        messages = [
+            Message(role="user", content=ref_text),
+            Message(role="assistant", content=AudioContent(audio_url=audio_path))
+        ]
+
+        return messages
+
+    async def stream_pcm_chunks(self, text: str, voice: str) -> AsyncIterator[bytes]:
+        """Stream PCM16 audio chunks using delta token streaming"""
+        from backend.boson_multimodal.data_types import ChatMLSample, Message
+
+        if not self._initialized:
+            raise RuntimeError("TTS Manager not initialized")
+
+        # Load voice reference messages
+        messages = self._load_voice_reference(voice)
+
+        # Add user message with text to generate
+        messages.append(Message(role="user", content=text))
+
+        # Create ChatML sample
+        chat_sample = ChatMLSample(messages=messages)
+
+        # Stream generation with delta tokens
+        try:
+            output = self.serve_engine.generate_delta_stream(
+                chat_ml_sample=chat_sample,
+                max_new_tokens=1024,
+                temperature=0.7,
+                top_p=0.95,
+                top_k=50,
+                stop_strings=['<|end_of_text|>', '<|eot_id|>'],
+                ras_win_len=7,
+                ras_win_max_num_repeat=2,
+                force_audio_gen=True,
+            )
+
+            # Initialize streaming state
+            audio_tokens: List[torch.Tensor] = []
+            audio_tensor: Optional[torch.Tensor] = None
+            seq_len = 0
+
+            # Crossfade setup
+            cross_fade_samples = int(self._chunk_overlap_duration * self.sample_rate)
+            fade_out = np.linspace(1, 0, cross_fade_samples) if cross_fade_samples > 0 else None
+            fade_in = np.linspace(0, 1, cross_fade_samples) if cross_fade_samples > 0 else None
+            prev_tail: Optional[np.ndarray] = None
+
+            with torch.inference_mode():
+                async for delta in output:
+                    # Skip if no audio tokens
+                    if delta.audio_tokens is None:
+                        continue
+
+                    # Check for end token (1025)
+                    if torch.all(delta.audio_tokens == 1025):
+                        break
+
+                    # Accumulate audio tokens
+                    audio_tokens.append(delta.audio_tokens[:, None])
+                    audio_tensor = torch.cat(audio_tokens, dim=-1)
+
+                    # Count sequence length (skip padding token 1024)
+                    if torch.all(delta.audio_tokens != 1024):
+                        seq_len += 1
+
+                    # Decode and yield when chunk size reached
+                    if seq_len > 0 and seq_len % self._chunk_size == 0:
+                        try:
+                            # Revert delay pattern and decode
+                            vq_code = (
+                                revert_delay_pattern(audio_tensor, start_idx=seq_len - self._chunk_size + 1)
+                                .clip(0, 1023)
+                                .to(self._device)
+                            )
+                            waveform_tensor = self.serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
+
+                            # Convert to numpy
+                            if isinstance(waveform_tensor, torch.Tensor):
+                                waveform_np = waveform_tensor.detach().cpu().numpy()
+                            else:
+                                waveform_np = np.asarray(waveform_tensor, dtype=np.float32)
+
+                            # Apply crossfade
+                            if prev_tail is None:
+                                # First chunk
+                                if cross_fade_samples > 0 and waveform_np.size > cross_fade_samples:
+                                    chunk_head = waveform_np[:-cross_fade_samples]
+                                    prev_tail = waveform_np[-cross_fade_samples:]
+                                else:
+                                    chunk_head = waveform_np
+                                    prev_tail = None
+
+                                if chunk_head.size > 0:
+                                    # Convert to PCM16 and yield
+                                    pcm = np.clip(chunk_head, -1.0, 1.0)
+                                    pcm16 = (pcm * 32767.0).astype(np.int16)
+                                    yield pcm16.tobytes()
+                            else:
+                                # Subsequent chunks with crossfade
+                                if cross_fade_samples > 0 and waveform_np.size >= cross_fade_samples:
+                                    overlap = prev_tail * fade_out + waveform_np[:cross_fade_samples] * fade_in
+                                    middle = (
+                                        waveform_np[cross_fade_samples:-cross_fade_samples]
+                                        if waveform_np.size > 2 * cross_fade_samples
+                                        else np.array([], dtype=waveform_np.dtype)
+                                    )
+                                    to_send = overlap if middle.size == 0 else np.concatenate([overlap, middle])
+
+                                    if to_send.size > 0:
+                                        # Convert to PCM16 and yield
+                                        pcm = np.clip(to_send, -1.0, 1.0)
+                                        pcm16 = (pcm * 32767.0).astype(np.int16)
+                                        yield pcm16.tobytes()
+
+                                    prev_tail = waveform_np[-cross_fade_samples:]
+                                else:
+                                    # Convert to PCM16 and yield
+                                    pcm = np.clip(waveform_np, -1.0, 1.0)
+                                    pcm16 = (pcm * 32767.0).astype(np.int16)
+                                    yield pcm16.tobytes()
+
+                        except Exception as e:
+                            # Skip errors and continue
+                            logger.warning(f"Error decoding audio chunk: {e}")
+                            continue
+
+            # Flush remaining tokens
+            if seq_len > 0 and seq_len % self._chunk_size != 0 and audio_tensor is not None:
+                try:
+                    vq_code = (
+                        revert_delay_pattern(audio_tensor, start_idx=seq_len - seq_len % self._chunk_size + 1)
+                        .clip(0, 1023)
+                        .to(self._device)
+                    )
+                    waveform_tensor = self.serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
+
+                    if isinstance(waveform_tensor, torch.Tensor):
+                        waveform_np = waveform_tensor.detach().cpu().numpy()
+                    else:
+                        waveform_np = np.asarray(waveform_tensor, dtype=np.float32)
+
+                    if prev_tail is None:
+                        pcm = np.clip(waveform_np, -1.0, 1.0)
+                        pcm16 = (pcm * 32767.0).astype(np.int16)
+                        yield pcm16.tobytes()
+                    else:
+                        if cross_fade_samples > 0 and waveform_np.size >= cross_fade_samples:
+                            overlap = prev_tail * fade_out + waveform_np[:cross_fade_samples] * fade_in
+                            rest = waveform_np[cross_fade_samples:]
+                            to_send = overlap if rest.size == 0 else np.concatenate([overlap, rest])
+
+                            pcm = np.clip(to_send, -1.0, 1.0)
+                            pcm16 = (pcm * 32767.0).astype(np.int16)
+                            yield pcm16.tobytes()
+                        else:
+                            pcm = np.clip(waveform_np, -1.0, 1.0)
+                            pcm16 = (pcm * 32767.0).astype(np.int16)
+                            yield pcm16.tobytes()
+                except Exception as e:
+                    logger.warning(f"Error flushing remaining audio: {e}")
+
+            # Yield final tail if exists
+            if prev_tail is not None and prev_tail.size > 0:
+                pcm = np.clip(prev_tail, -1.0, 1.0)
+                pcm16 = (pcm * 32767.0).astype(np.int16)
+                yield pcm16.tobytes()
+
+        except Exception as e:
+            logger.error(f"Error in TTS streaming: {e}")
+            raise
+
+    def get_available_voices(self):
+        """Get list of available voices in format expected by frontend"""
+        if not os.path.exists(self.voice_dir):
+            return []
+
+        voices = []
+        for file in os.listdir(self.voice_dir):
+            if file.endswith('.wav'):
+                voice_name = file[:-4]  # Remove .wav extension
+                # Only include if matching .txt file exists
+                if os.path.exists(os.path.join(self.voice_dir, f"{voice_name}.txt")):
+                    # Format: {id: "voice_name", name: "Voice Name"}
+                    display_name = voice_name.replace('_', ' ').title()
+                    voices.append({
+                        "id": voice_name,
+                        "name": display_name
+                    })
+
+        # Sort by display name
+        voices.sort(key=lambda v: v['name'])
+        return voices
+
+    def shutdown(self):
+        """Cleanup resources"""
+        logger.info('Shutting down TTS manager')
+        self.serve_engine = None
+        self._initialized = False
 
 ########################################
 ##--        WebSocket Manager       --##
