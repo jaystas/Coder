@@ -86,20 +86,30 @@ class ModelSettings:
     presence_penalty: float
     repetition_penalty: float
 
-@dataclass
-class SentenceTTS:
-    text: str
-    speaker: Character
-    voice: Optional[Voice]
-    sentence_index: int
-    is_final: bool
-    timestamp: float = field(default_factory=time.time)
-
 @dataclass 
 class TextChunk:
     text: str
     message_id: str
     character_name: str
+    chunk_index: int
+    is_final: bool
+    timestamp: float
+
+@dataclass 
+class ResponseChunk:
+    text: str
+    message_id: str
+    character_name: str
+    chunk_index: int
+    is_final: bool
+    timestamp: float
+
+@dataclass
+class TTSChunk:
+    text: str
+    message_id: str
+    character_name: Character
+    voice: Optional[Voice]
     chunk_index: int
     is_final: bool
     timestamp: float
@@ -147,13 +157,11 @@ class Queues:
 
     def __init__(self):
 
-        self.transcribed_text = asyncio.Queue()
+        self.transcribe_queue = asyncio.Queue()
 
         self.response_queue = asyncio.Queue()
 
         self.sentence_queue = asyncio.Queue()
-
-        self.tts_sentence_queue = asyncio.Queue()
 
         self.audio_queue = asyncio.Queue()
 
@@ -457,7 +465,7 @@ class TextToSentence:
     async def get_sentences(self) -> AsyncIterator[tuple[str, int]]:
         """
         Async generator that yields sentences as they become available.
-        Yields: (sentence_text, sentence_index)
+        Yields: (sentence_text, index)
         """
         loop = asyncio.get_event_loop()
         
@@ -512,7 +520,7 @@ class LLMService:
         # Per-response tracking (reset for each character response)
         self.sentence_extractor: Optional[TextToSentence] = None
         self.chunk_index = 0
-        self.sentence_index = 0
+        self.index = 0
         self.response_text = ""
         self.is_complete = False
 
@@ -602,7 +610,7 @@ class LLMService:
     def reset_response_tracking(self):
         """Reset per-response tracking variables"""
         self.chunk_index = 0
-        self.sentence_index = 0
+        self.index = 0
         self.response_text = ""
         self.is_complete = False
 
@@ -668,7 +676,7 @@ class LLMService:
         while True:
             try:
 
-                user_message = await self.queues.transcribed_text.get()
+                user_message = await self.queues.transcribe_queue.get()
 
                 if not user_message or not user_message.strip():
                     continue
@@ -775,44 +783,46 @@ class LLMService:
             character: The character whose sentences are being processed
             message_id: Unique ID for the current message
         """
-        sentences_queued = []
-        sentence_index = 0
+        sentences = []
+        index = 0
 
         try:
-            async for sentence, sentence_index in self.sentence_extractor.get_sentences():
+            async for sentence, index in self.sentence_extractor.get_sentences():
                 # Check for interrupt
                 if self.interrupt_event.is_set():
                     break
 
-                sentences_queued.append(sentence)
+                sentences.append(sentence)
 
                 # Queue for TTS immediately
-                sentence_tts = SentenceTTS(
+                sentence = TTSChunk(
                     text=sentence,
-                    speaker=character,
+                    message_id=message_id,
+                    character=character,
                     voice=Voice,
-                    sentence_index=sentence_index,
+                    index=index,
                     is_final=False,
                     timestamp=time.time()
                 )
-                await self.queues.tts_sentence_queue.put(sentence_tts)
+                await self.queues.sentence_queue.put(sentence)
 
-                logger.info(f"Sentence {sentence_index} queued for TTS ({character.name}): "
+                logger.info(f"Sentence {index} queued for TTS ({character.name}): "
                            f"{sentence[:50]}{'...' if len(sentence) > 50 else ''}")
 
-                sentence_index += 1
+                index += 1
 
             # Send final marker for this character's TTS
-            if sentences_queued:
-                final_marker = SentenceTTS(
-                    text="",  # Empty text signals completion
-                    speaker=character,
-                    voice=None,
-                    sentence_index=sentence_index,
+            if sentences:
+                final_marker = TTSChunk(
+                    text="",
+                    message_id=message_id,
+                    character=character,
+                    voice=Voice,
+                    index=index,
                     is_final=True,
                     timestamp=time.time()
                 )
-                await self.queues.tts_sentence_queue.put(final_marker)
+                await self.queues.sentence_queue.put(final_marker)
 
         except Exception as e:
             logger.error(f"Error processing sentences for {character.name}: {e}")
@@ -1178,9 +1188,9 @@ class WebSocketManager:
 
         # Clear queues
         if self.queues:
-            while not self.queues.tts_sentence_queue.empty():
+            while not self.queues.sentence_queue.empty():
                 try:
-                    self.queues.tts_sentence_queue.get_nowait()
+                    self.queues.sentence_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
 
@@ -1272,7 +1282,7 @@ class WebSocketManager:
 
     async def handle_user_message(self, user_message: str):
         """Process manually sent user message"""
-        await self.queues.transcribed_text.put(user_message)
+        await self.queues.transcribe_queue.put(user_message)
 
     async def stream_text_to_client(self):
         """Stream response/text chunks from response_queue to WebSocket"""
@@ -1308,7 +1318,7 @@ class WebSocketManager:
         await self.send_text_to_client({"type": "stt_stabilized", "text": text})
     
     async def on_final_transcription(self, user_message: str):
-        await self.queues.transcribed_text.put(user_message)
+        await self.queues.transcribe_queue.put(user_message)
         await self.send_text_to_client({"type": "stt_final", "text": user_message})
 
     async def on_character_response_chunk(self, response_chunk: str):
