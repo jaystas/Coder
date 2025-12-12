@@ -1,0 +1,36 @@
+{
+  "request": {
+    "model": "deepseek/deepseek-chat-v3-0324",
+    "messages": [
+      {
+        "role": "system",
+        "content": "This is the main system prompt. It is sent once at the beginning of the conversation. Included in conversation history, stays up top."
+      },
+      {
+        "role": "user",
+        "name": "Jay",
+        "content": "Hey Erica and Paige, how are you tonight?"
+      },
+      {
+        "role": "assistant",
+        "name": "Erica",
+        "content": "Oh Jay, we're just lovely, thanks."
+      },
+      {
+        "role": "assistant",
+        "name": "Paige",
+        "content": "Yeah, we're great, thanks for asking!"
+      },
+      {
+        "role": "user",
+        "name": "Jay",
+        "content": "Awesome! Hey Paige, what time is it?"
+      },
+      {
+        "role": "system",
+        "content": "We also append what we call the 'character instruction message' to the end of the conversation history. This is sent with every request --> 'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}'s reply. Do not respond for/as anyone else. Wrap your entire response in <{character.name}></{character.name}> tags.'"
+      }
+    ]
+  }
+}
+

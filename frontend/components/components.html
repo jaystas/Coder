@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Chat Interface - Component Library</title>
+    <link rel="stylesheet" href="components.css">
+</head>
+
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>AI Chat Interface Components</h1>
+            <p class="subtitle">Dark Theme Component Library</p>
+        </header>
+
+        <!-- Base Blocks Section -->
+        <section class="section">
+            <h2 class="section-title">Base Blocks / Boxes</h2>
+            <div class="component-grid">
+                <div class="component-item">
+                    <label class="component-label">.base-block-subtle</label>
+                    <div class="base-block-subtle" style="height: 120px;"></div>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">.base-block-dramatic</label>
+                    <div class="base-block-dramatic" style="height: 120px;"></div>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">.base-block-glow</label>
+                    <div class="base-block-glow" style="height: 120px;"></div>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">.base-block-layered</label>
+                    <div class="base-block-layered" style="height: 120px;"></div>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">.base-block-colored</label>
+                    <div class="base-block-colored" style="height: 120px;"></div>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">.base-block-border-subtle</label>
+                    <div class="base-block-border-subtle" style="height: 120px;"></div>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">.base-block-border-lighter</label>
+                    <div class="base-block-border-lighter" style="height: 120px;"></div>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">.base-block-border-glow</label>
+                    <div class="base-block-border-glow" style="height: 120px;"></div>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">.base-block-border-prominent</label>
+                    <div class="base-block-border-prominent" style="height: 120px;"></div>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">.base-block-border-clean</label>
+                    <div class="base-block-border-clean" style="height: 120px;"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Buttons Section -->
+        <section class="section">
+            <h2 class="section-title">Buttons</h2>
+            <div class="component-grid">
+                <div class="component-item">
+                    <label class="component-label">Primary Button</label>
+                    <button class="btn btn-primary">Generate</button>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">Primary Button (Icon)</label>
+                    <button class="btn btn-primary">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <path d="M8 2V14M2 8H14" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                        </svg>
+                        New Chat
+                    </button>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">Secondary Button</label>
+                    <button class="btn btn-secondary">Cancel</button>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">Ghost Button</label>
+                    <button class="btn btn-ghost">Learn More</button>
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">Icon Button</label>
+                    <button class="btn btn-icon">
+                        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                            <path d="M10 5V15M5 10H15" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Text Areas Section -->
+        <section class="section">
+            <h2 class="section-title">Text Areas</h2>
+            <div class="component-grid">
+                <div class="component-item full-width">
+                    <label class="component-label">Standard Text Area</label>
+                    <textarea class="textarea" placeholder="Enter your message here..." rows="4"></textarea>
+                </div>
+
+                <div class="component-item full-width">
+                    <label class="component-label">Text Area with Focus Border</label>
+                    <textarea class="textarea textarea-focus" placeholder="Type your prompt..." rows="4"></textarea>
+                </div>
+            </div>
+        </section>
+
+        <!-- Input Fields Section -->
+        <section class="section">
+            <h2 class="section-title">Input Fields</h2>
+            <div class="component-grid">
+                <div class="component-item">
+                    <label class="component-label">Text Input</label>
+                    <input type="text" class="input" placeholder="Enter text...">
+                </div>
+
+                <div class="component-item">
+                    <label class="component-label">Search Input</label>
+                    <div class="input-group">
+                        <svg class="input-icon" width="20" height="20" viewBox="0 0 20 20" fill="none">
+                            <circle cx="8" cy="8" r="5" stroke="currentColor" stroke-width="1.5" />
+                            <path d="M12 12L17 17" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                        </svg>
+                        <input type="text" class="input input-with-icon" placeholder="Search...">
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Dropdowns Section -->
+        <section class="section">
+            <h2 class="section-title">Dropdowns & Selects</h2>
+            <div class="component-grid">
+                <div class="component-item">
+                    <label class="component-label">Custom Dropdown</label>
+                    <div class="dropdown">
+                        <button class="dropdown-trigger">
+                            <span class="dropdown-value">Select option</span>
+                            <svg class="dropdown-arrow" width="16" height="16" viewBox="0 0 16 16" fill="none">
+                                <path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                    stroke-linejoin="round" />
+                            </svg>
+                        </button>
+                        <div class="dropdown-menu">
+                            <div class="dropdown-item" data-value="sonnet">
+                                <div class="dropdown-item-title">Claude Sonnet 4.5</div>
+                                <div class="dropdown-item-desc">Most intelligent model</div>
+                            </div>
+                            <div class="dropdown-item" data-value="opus">
+                                <div class="dropdown-item-title">Claude Opus 4</div>
+                                <div class="dropdown-item-desc">Powerful performance</div>
+                            </div>
+                            <div class="dropdown-item" data-value="haiku">
+                                <div class="dropdown-item-title">Claude Haiku 3.5</div>
+                                <div class="dropdown-item-desc">Fast and efficient</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Toggle Switches Section -->
+        <section class="section">
+            <h2 class="section-title">Toggle Switches</h2>
+            <div class="component-grid">
+                <div class="component-item">
+                    <label class="toggle-label">
+                        <input type="checkbox" class="toggle-input">
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-text">Enable notifications</span>
+                    </label>
+                </div>
+
+                <div class="component-item">
+                    <label class="toggle-label">
+                        <input type="checkbox" class="toggle-input" checked>
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-text">Dark mode (enabled)</span>
+                    </label>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tabs Section -->
+        <section class="section">
+            <h2 class="section-title">Tabs</h2>
+            <div class="component-grid">
+                <div class="component-item full-width">
+                    <label class="component-label">Tab Component</label>
+                    <div class="tabs">
+                        <div class="tabs-header">
+                            <button class="tab-button active" data-tab="tab1">Model</button>
+                            <button class="tab-button" data-tab="tab2">Speech</button>
+                            <button class="tab-button" data-tab="tab3">Settings</button>
+                        </div>
+                        <div class="tabs-content">
+                            <div class="tab-panel active" id="tab1">
+                                <h3 style="margin-bottom: 12px; font-size: 16px;">Model Configuration</h3>
+                                <p style="color: var(--color-text-secondary);">Configure your AI model settings and
+                                    parameters here.</p>
+                            </div>
+                            <div class="tab-panel" id="tab2">
+                                <h3 style="margin-bottom: 12px; font-size: 16px;">Speech Settings</h3>
+                                <p style="color: var(--color-text-secondary);">Adjust voice and speech synthesis
+                                    options.</p>
+                            </div>
+                            <div class="tab-panel" id="tab3">
+                                <h3 style="margin-bottom: 12px; font-size: 16px;">General Settings</h3>
+                                <p style="color: var(--color-text-secondary);">Manage your application preferences and
+                                    settings.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script src="components.js"></script>
+</body>
+
+</html>
