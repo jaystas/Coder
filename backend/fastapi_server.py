@@ -4,6 +4,7 @@ import sys
 import json
 import time
 import uuid
+import queue
 import torch
 import uvicorn
 import asyncio
@@ -13,8 +14,10 @@ import requests
 import threading
 import numpy as np
 import multiprocessing
+import stream2sentence as s2s
 from datetime import datetime
 from pydantic import BaseModel
+from queue import Queue, Empty
 from openai import AsyncOpenAI
 from collections import defaultdict
 from collections.abc import Awaitable
@@ -27,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator
+from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 from enum import Enum, auto
 
@@ -34,7 +38,7 @@ from backend.RealtimeSTT import AudioToTextRecorder
 from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
 from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioContent
-from backend.async_sentence_generator import generate_sentences, SentenceConfig, init_tokenizer
+from backend.RealtimeTTS.threadsafe_generators import CharIterator, AccumulatingThreadSafeGenerator
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jslevsbvapopncjehhva.supabase.co")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpzbGV2c2J2YXBvcG5jamVoaHZhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgwNTQwOTMsImV4cCI6MjA3MzYzMDA5M30.DotbJM3IrvdVzwfScxOtsSpxq0xsj7XxI3DvdiqDSrE")
@@ -326,6 +330,171 @@ class STTService:
             callback(*args)
 
 ########################################
+##--   Text to Sentence Extractor   --##
+########################################
+
+class TextToSentence:
+    """
+    Bridges async LLM text stream to synchronous stream2sentence library.
+    
+    Architecture:
+    - Async side: Receives text chunks, feeds to CharIterator
+    - Sync side: stream2sentence extracts sentences in background thread
+    - Output: Sentences are pushed to an async queue as they're detected
+    
+    This enables true streaming: first sentence starts TTS while LLM is still
+    generating subsequent text.
+    """
+    
+    def __init__(
+        self,
+        sentence_callback: Callable[[str, int], None] = None,
+        minimum_sentence_length: int = 25,
+        minimum_first_fragment_length: int = 10,
+        quick_yield_single_sentence_fragment: bool = True,
+        cleanup_text_links: bool = True,
+        cleanup_text_emojis: bool = False,
+        tokenize_sentences: bool = False,
+    ):
+
+        self.sentence_callback = sentence_callback
+        
+        self.s2s_config = {
+            "minimum_sentence_length": minimum_sentence_length,
+            "minimum_first_fragment_length": minimum_first_fragment_length,
+            "quick_yield_single_sentence_fragment": quick_yield_single_sentence_fragment,
+            "cleanup_text_links": cleanup_text_links,
+            "cleanup_text_emojis": cleanup_text_emojis,
+            "tokenize_sentences": tokenize_sentences,
+        }
+        
+        # Thread-safe components
+        self.char_iter: Optional[CharIterator] = None
+        self.thread_safe_iter: Optional[AccumulatingThreadSafeGenerator] = None
+
+        # Sentence output queue (thread-safe)
+        self.sentence_queue = Queue()
+
+        # Control
+        self.sentences_thread: Optional[threading.Thread] = None
+        self._is_running = False
+        self._is_complete = False
+        self._sentence_count = 0
+        self._accumulated_text = ""
+        
+        # Thread pool for non-blocking operations
+        self._executor = ThreadPoolExecutor(max_workers=1)
+    
+    def start(self):
+        """Initialize and start the sentence extraction pipeline"""
+        self.char_iter = CharIterator()
+        self.thread_safe_iter = AccumulatingThreadSafeGenerator(self.char_iter)
+        self.sentence_queue = Queue()
+        
+        self._is_running = True
+        self._is_complete = False
+        self._sentence_count = 0
+        self._accumulated_text = ""
+        
+        # Start sentence extraction thread
+        self.sentences_thread = threading.Thread(target=self.run_sentence_generator, daemon=True)
+        self.sentences_thread.start()
+    
+    def feed_text(self, text: str):
+        """
+        Feed text chunk from LLM stream.
+        Thread-safe, can be called from async context.
+        """
+        if not self._is_running:
+            return
+            
+        self._accumulated_text += text
+        self.char_iter.add(text)
+
+    def get_accumulated_text(self) -> str:
+        """Get all text that was fed to the sentence extractor"""
+        return self._accumulated_text
+    
+    def finish(self):
+        """
+        Signal that LLM stream is complete.
+        Flushes any remaining text as final sentence.
+        """
+        if not self._is_running:
+            return
+            
+        self._is_complete = True
+        
+        # Signal end to CharIterator
+        if self.char_iter:
+            self.char_iter.add("")  # Empty string can signal completion
+    
+    def run_sentence_generator(self):
+        """
+        Background thread: Extract sentences using stream2sentence.
+        Runs until stream is complete and all sentences are extracted.
+        """
+        try:
+            sentence_generator = s2s.generate_sentences(
+                self.thread_safe_iter,
+                **self.s2s_config
+            )
+            
+            for sentence in sentence_generator:
+                if not self._is_running:
+                    break
+                    
+                sentence = sentence.strip()
+                if sentence:
+                    # Push to queue
+                    self.sentence_queue.put((sentence, self._sentence_count))
+                    
+                    # Callback if provided
+                    if self.sentence_callback:
+                        self.sentence_callback(sentence, self._sentence_count)
+                    
+                    self._sentence_count += 1
+                    
+        except Exception as e:
+            print(f"Sentence extraction error: {e}")
+        finally:
+            # Signal completion
+            self.sentence_queue.put(None)  # Sentinel value
+            self._is_running = False
+    
+    async def get_sentences(self) -> AsyncIterator[tuple[str, int]]:
+        """
+        Async generator that yields sentences as they become available.
+        Yields: (sentence_text, index)
+        """
+        loop = asyncio.get_event_loop()
+        
+        while True:
+            try:
+                # Non-blocking check with short timeout
+                sentence = await loop.run_in_executor(self._executor, lambda: self.sentence_queue.get(timeout=0.02))
+                
+                if sentence is None:  # Sentinel
+                    break
+                    
+                yield sentence
+                
+            except Empty:
+                # No sentence ready yet, yield control
+                await asyncio.sleep(0.005)
+                
+                # Check if we should exit
+                if not self._is_running and self.sentence_queue.empty():
+                    break
+    
+    def shutdown(self):
+        """Clean shutdown"""
+        self._is_running = False
+        if self.sentences_thread and self.sentences_thread.is_alive():
+            self.sentences_thread.join(timeout=1.0)
+        self._executor.shutdown(wait=False)
+
+########################################
 ##--           LLM Service          --##
 ########################################
 
@@ -349,6 +518,7 @@ class LLMService:
         self.model_settings: Optional[ModelSettings] = None
 
         # Per-response tracking (reset for each character response)
+        self.sentence_extractor: Optional[TextToSentence] = None
         self.chunk_index = 0
         self.index = 0
         self.response_text = ""
@@ -551,102 +721,111 @@ class LLMService:
         """Generate and stream a single character's response."""
 
         message_id = f"msg-{character.id}-{int(time.time() * 1000)}"
-        self.reset_response_tracking()
 
-        # Stop event for cancellation
-        stop_event = asyncio.Event()
-        sentence_idx = 0
+        # Create new sentence extractor for this response
+        self.sentence_extractor = TextToSentence()
+        self.sentence_extractor.start()
+        
+        # Create task for sentence-to-TTS processing
+        sentence_task = asyncio.create_task(self.process_sentences_for_tts(character=character, message_id=message_id))
 
-        # Wrap LLM stream to also send UI chunks
-        async def llm_token_stream():
+        try:
+            # Stream from LLM
             async for chunk in text_stream:
                 # Check for interrupt
                 if self.interrupt_event.is_set():
-                    stop_event.set()
                     logger.info(f"Interrupt detected during {character.name}'s response")
                     break
 
+                # Extract content from chunk
                 content = chunk.choices[0].delta.content
                 if content:
                     self.response_text += content
 
+                    # Feed to sentence extractor (non-blocking)
+                    self.sentence_extractor.feed_text(content)
+
                     # Stream to UI immediately
-                    response_chunk = TextChunk(
-                        text=content,
-                        message_id=message_id,
-                        character_name=character.name,
-                        chunk_index=self.chunk_index,
-                        is_final=False,
-                        timestamp=time.time()
-                    )
+                    response_chunk = TextChunk(text=content, message_id=message_id, character_name=character.name, 
+                                               chunk_index=self.chunk_index, is_final=False, timestamp=time.time())
+                    
                     await self.queues.response_queue.put(response_chunk)
                     self.chunk_index += 1
 
-                    yield content
-
-        try:
-            # Configure sentence generation for low latency
-            config = SentenceConfig(
-                minimum_sentence_length=10,
-                minimum_first_fragment_length=10,
-                fast_sentence_fragment=True
-            )
-
-            # Internal queue for sentence generator (required by API)
-            internal_queue = asyncio.Queue()
-
-            # Process tokens -> sentences -> TTS queue
-            async for sentence in generate_sentences(
-                llm_token_stream(),
-                internal_queue,
-                config=config,
-                stop_event=stop_event
-            ):
-                # Wrap sentence and queue for TTS
-                tts_chunk = TTSChunk(
-                    text=sentence,
-                    message_id=message_id,
-                    character_name=character,
-                    voice=None,
-                    chunk_index=sentence_idx,
-                    is_final=False,
-                    timestamp=time.time()
-                )
-                await self.queues.sentence_queue.put(tts_chunk)
-                logger.info(f"Sentence {sentence_idx} queued for TTS ({character.name}): "
-                           f"{sentence[:50]}{'...' if len(sentence) > 50 else ''}")
-                sentence_idx += 1
+            # Signal LLM stream complete
+            self.sentence_extractor.finish()
 
             # Send final text chunk to UI
-            final_text_chunk = TextChunk(
-                text="",
-                message_id=message_id,
-                character_name=character.name,
-                chunk_index=self.chunk_index,
-                is_final=True,
-                timestamp=time.time()
-            )
-            await self.queues.response_queue.put(final_text_chunk)
+            response_text = TextChunk(text="", message_id=message_id, character_name=character.name, 
+                                      chunk_index=self.chunk_index, is_final=True, timestamp=time.time())
+            
+            await self.queues.response_queue.put(response_text)
 
-            # Send final marker for TTS
-            final_tts_chunk = TTSChunk(
-                text="",
-                message_id=message_id,
-                character_name=character,
-                voice=None,
-                chunk_index=sentence_idx,
-                is_final=True,
-                timestamp=time.time()
-            )
-            await self.queues.sentence_queue.put(final_tts_chunk)
+            # Wait for sentence processing to complete
+            await sentence_task
 
         except Exception as e:
             logger.error(f"Error in character_response_stream for {character.name}: {e}")
             raise
         finally:
+            if self.sentence_extractor:
+                self.sentence_extractor.shutdown()
             self.is_complete = True
 
         return self.response_text
+
+    async def process_sentences_for_tts(self, character: Character, message_id: str):
+        """
+        Process sentences as they're extracted and queue for TTS.
+        Runs concurrently with LLM text stream.
+
+        Args:
+            character: The character whose sentences are being processed
+            message_id: Unique ID for the current message
+        """
+        sentences = []
+        index = 0
+
+        try:
+            async for sentence, index in self.sentence_extractor.get_sentences():
+                # Check for interrupt
+                if self.interrupt_event.is_set():
+                    break
+
+                sentences.append(sentence)
+
+                # Queue for TTS immediately
+                sentence = TTSChunk(
+                    text=sentence,
+                    message_id=message_id,
+                    character=character,
+                    voice=Voice,
+                    index=index,
+                    is_final=False,
+                    timestamp=time.time()
+                )
+                await self.queues.sentence_queue.put(sentence)
+
+                logger.info(f"Sentence {index} queued for TTS ({character.name}): "
+                           f"{sentence[:50]}{'...' if len(sentence) > 50 else ''}")
+
+                index += 1
+
+            # Send final marker for this character's TTS
+            if sentences:
+                final_marker = TTSChunk(
+                    text="",
+                    message_id=message_id,
+                    character=character,
+                    voice=Voice,
+                    index=index,
+                    is_final=True,
+                    timestamp=time.time()
+                )
+                await self.queues.sentence_queue.put(final_marker)
+
+        except Exception as e:
+            logger.error(f"Error processing sentences for {character.name}: {e}")
 
 ########################################
 ##--           TTS Service          --##
@@ -666,10 +845,9 @@ def revert_delay_pattern(data: torch.Tensor, start_idx: int = 0) -> torch.Tensor
     return torch.cat(out, dim=0)
 
 class TTSService:
-    """Higgs Streaming TTS Service"""
+    """Higgs Streaming"""
 
-    def __init__(self, queues: Queues = None):
-        self.queues = queues
+    def __init__(self):
         self.serve_engine = None
         self.voice_dir = "/workspace/tts/Code/backend/voices"
         self.sample_rate = 24000
@@ -679,7 +857,7 @@ class TTSService:
         self._chunk_size = 16  # Tokens per streaming chunk
         self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    async def initialize(self):
+    def initialize(self):
         """Initialize Higgs Audio TTS engine"""
         if self._initialized:
             return
@@ -915,47 +1093,7 @@ class TTSService:
         voices.sort(key=lambda v: v['name'])
         return voices
 
-    async def main_tts_loop(self, send_audio_callback: Callable[[bytes], Awaitable[None]]):
-        """
-        Main TTS loop - consumes sentences from queue and streams audio.
-
-        Args:
-            send_audio_callback: Async callback to send audio bytes to client
-        """
-        logger.info("TTS main loop started")
-
-        while True:
-            try:
-                # Wait for next sentence from queue
-                tts_chunk: TTSChunk = await self.queues.sentence_queue.get()
-
-                # Skip final markers (empty text signals end of message)
-                if tts_chunk.is_final or not tts_chunk.text:
-                    continue
-
-                # Get voice from character (fallback to default)
-                voice = tts_chunk.character_name.voice if hasattr(tts_chunk.character_name, 'voice') else "default"
-                if not voice:
-                    voice = "default"
-
-                logger.info(f"TTS processing: '{tts_chunk.text[:50]}...' with voice '{voice}'")
-
-                # Stream audio chunks to client
-                try:
-                    async for audio_bytes in self.stream_pcm_chunks(tts_chunk.text, voice):
-                        await send_audio_callback(audio_bytes)
-                except Exception as e:
-                    logger.error(f"Error streaming TTS audio: {e}")
-                    continue
-
-            except asyncio.CancelledError:
-                logger.info("TTS main loop cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in TTS main loop: {e}")
-                continue
-
-    async def shutdown(self):
+    def shutdown(self):
         """Cleanup resources"""
         logger.info('Shutting down TTS manager')
         self.serve_engine = None
