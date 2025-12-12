@@ -660,7 +660,7 @@ class LLMService:
             )
         return self.model_settings
 
-    async def main_llm_loop(self, user_name: str = "Jay"):
+    async def conversation_loop(self, user_name: str = "Jay"):
         """Main LLM conversation loop for multi-character conversations."""
 
         logger.info("Starting main LLM loop")
@@ -738,14 +738,9 @@ class LLMService:
                     self.sentence_extractor.feed_text(content)
 
                     # Stream to UI immediately
-                    response_chunk = TextChunk(
-                        text=content,
-                        message_id=message_id,
-                        character_name=character.name,
-                        chunk_index=self.chunk_index,
-                        is_final=False,
-                        timestamp=time.time()
-                    )
+                    response_chunk = TextChunk(text=content, message_id=message_id, character_name=character.name, 
+                                               chunk_index=self.chunk_index, is_final=False, timestamp=time.time())
+                    
                     await self.queues.response_queue.put(response_chunk)
                     self.chunk_index += 1
 
@@ -753,14 +748,9 @@ class LLMService:
             self.sentence_extractor.finish()
 
             # Send final text chunk to UI
-            response_text = TextChunk(
-                text="",
-                message_id=message_id,
-                character_name=character.name,
-                chunk_index=self.chunk_index,
-                is_final=True,
-                timestamp=time.time()
-            )
+            response_text = TextChunk(text="", message_id=message_id, character_name=character.name, 
+                                      chunk_index=self.chunk_index, is_final=True, timestamp=time.time())
+            
             await self.queues.response_queue.put(response_text)
 
             # Wait for sentence processing to complete
@@ -883,12 +873,12 @@ class TTSService:
             logger.error(f"Failed to initialize Higgs Audio TTS: {e}")
             raise
 
-    def _load_voice_reference(self, voice_name: str):
+    def _load_voice_reference(self, voice: str):
         """Load reference audio and text for voice cloning"""
         from backend.boson_multimodal.data_types import Message, AudioContent
 
-        audio_path = os.path.join(self.voice_dir, f"{voice_name}.wav")
-        text_path = os.path.join(self.voice_dir, f"{voice_name}.txt")
+        audio_path = os.path.join(self.voice_dir, f"{voice}.wav")
+        text_path = os.path.join(self.voice_dir, f"{voice}.txt")
 
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Voice audio file not found: {audio_path}")
@@ -1079,13 +1069,13 @@ class TTSService:
         voices = []
         for file in os.listdir(self.voice_dir):
             if file.endswith('.wav'):
-                voice_name = file[:-4]  # Remove .wav extension
+                voice = file[:-4]  # Remove .wav extension
                 # Only include if matching .txt file exists
-                if os.path.exists(os.path.join(self.voice_dir, f"{voice_name}.txt")):
-                    # Format: {id: "voice_name", name: "Voice Name"}
-                    display_name = voice_name.replace('_', ' ').title()
+                if os.path.exists(os.path.join(self.voice_dir, f"{voice}.txt")):
+                    # Format: {id: "voice", name: "Voice Name"}
+                    display_name = voice.replace('_', ' ').title()
                     voices.append({
-                        "id": voice_name,
+                        "id": voice,
                         "name": display_name
                     })
 
@@ -1164,7 +1154,7 @@ class WebSocketManager:
         """Start all services"""
 
         self.service_tasks = [
-            asyncio.create_task(self.llm_service.main_llm_loop()),
+            asyncio.create_task(self.llm_service.conversation_loop()),
             asyncio.create_task(self.tts_service.main_tts_loop(send_audio_callback=self.stream_audio_to_client)),
             asyncio.create_task(self.stream_text_to_client())
         ]
