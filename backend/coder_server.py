@@ -30,9 +30,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable
+from stream2sentence import generate_sentences_async
 from concurrent.futures import ThreadPoolExecutor
-from loguru import logger
 from enum import Enum, auto
+from loguru import logger
 
 from backend.RealtimeSTT import AudioToTextRecorder
 from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
@@ -126,6 +127,11 @@ class AudioChunk:
     is_final: bool             # Last chunk in this message?
     timestamp: float = field(default_factory=time.time)
 
+@dataclass
+class Sentence:
+    sentence: str
+    index: int
+
 ########################################
 ##--             Queues             --##
 ########################################
@@ -145,49 +151,22 @@ class Queues:
 
 Callback = Callable[..., Optional[Awaitable[None]]]
 
-
 @dataclass
 class STTCallbacks:
     """Callback functions for STT events"""
-    # Transcription callbacks
     on_realtime_update: Optional[Callable[[str], Any]] = None
     on_realtime_stabilized: Optional[Callable[[str], Any]] = None
     on_final_transcription: Optional[Callable[[str], Any]] = None
-
-    # VAD callbacks
     on_vad_start: Optional[Callable[[], Any]] = None
     on_vad_stop: Optional[Callable[[], Any]] = None
-
-    # Recording callbacks
     on_recording_start: Optional[Callable[[], Any]] = None
     on_recording_stop: Optional[Callable[[], Any]] = None
 
-
 class STTPipeline:
-    """
-    Async-compatible Speech-to-Text service for voice chat applications.
-
-    Wraps RealtimeSTT's AudioToTextRecorder and bridges its threaded callbacks
-    to asyncio for use with FastAPI WebSocket handlers.
-
-    Usage:
-        stt = STTPipeline(
-            on_realtime_update=lambda text: broadcast({"type": "partial", "text": text}),
-            on_final_transcription=lambda text: llm_queue.put(text),
-            on_vad_start=handle_interrupt,
-        )
-
-        await stt.start()
-        stt.start_listening()  # User clicked mic
-
-        # Audio flows in from WebSocket handler:
-        async def handle_audio(data: bytes):
-            stt.feed_audio(data)
-    """
+    """Async-compatible Speech-to-Text."""
 
     def __init__(
         self,
-        # Async callbacks - bridged from RealtimeSTT's threads
         on_realtime_update: Optional[Callback] = None,
         on_realtime_stabilized: Optional[Callback] = None,
         on_final_transcription: Optional[Callback] = None,
@@ -195,60 +174,21 @@ class STTPipeline:
         on_vad_stop: Optional[Callback] = None,
         on_recording_start: Optional[Callback] = None,
         on_recording_stop: Optional[Callback] = None,
-
-        # Model configuration
         model: str = "small",
         realtime_model: str = "small",
         language: str = "en",
         device: str = "cuda",
         compute_type: str = "float16",
-
-        # Real-time transcription settings
         enable_realtime_transcription: bool = True,
         realtime_processing_pause: float = 0.1,
-        init_realtime_after_seconds: float = 0.15,
-
-        # VAD settings
         silero_sensitivity: float = 0.4,
         webrtc_sensitivity: int = 3,
-        post_speech_silence_duration: float = 0.5,
-        min_length_of_recording: float = 0.3,
-        pre_recording_buffer_duration: float = 0.5,
-
-        # Additional recorder kwargs
+        post_speech_silence_duration: float = 0.7,
+        min_length_of_recording: float = 0.5,
         **recorder_kwargs
     ):
-        """
-        Initialize the STT service.
+        """Initialize the STT service."""
 
-        Args:
-            on_realtime_update: Called with partial transcription text (may change)
-            on_realtime_stabilized: Called with stabilized text (more reliable)
-            on_final_transcription: Called with final transcription after speech ends
-            on_vad_start: Called when voice activity detected
-            on_vad_stop: Called when voice activity ends
-            on_recording_start: Called when recording begins
-            on_recording_stop: Called when recording ends
-
-            model: Main transcription model (for final transcription)
-            realtime_model: Model for real-time transcription (faster)
-            language: Language code for transcription
-            device: Device to run models on ("cuda" or "cpu")
-            compute_type: Compute type for models
-
-            enable_realtime_transcription: Enable real-time updates
-            realtime_processing_pause: Pause between real-time transcriptions
-            init_realtime_after_seconds: Delay before starting realtime
-
-            silero_sensitivity: Silero VAD sensitivity (0-1)
-            webrtc_sensitivity: WebRTC VAD sensitivity (0-3)
-            post_speech_silence_duration: Silence duration to end recording
-            min_length_of_recording: Minimum recording length
-            pre_recording_buffer_duration: Audio buffer before VAD triggers
-
-            **recorder_kwargs: Additional kwargs for AudioToTextRecorder
-        """
-        # Store user callbacks in dataclass to avoid name collision with handler methods
         self.callbacks = STTCallbacks(
             on_realtime_update=on_realtime_update,
             on_realtime_stabilized=on_realtime_stabilized,
@@ -267,12 +207,10 @@ class STTPipeline:
         self._compute_type = compute_type
         self._enable_realtime = enable_realtime_transcription
         self._realtime_pause = realtime_processing_pause
-        self._realtime_init_delay = init_realtime_after_seconds
         self._silero_sensitivity = silero_sensitivity
         self._webrtc_sensitivity = webrtc_sensitivity
         self._post_speech_silence = post_speech_silence_duration
         self._min_recording_length = min_length_of_recording
-        self._pre_recording_buffer = pre_recording_buffer_duration
         self._recorder_kwargs = recorder_kwargs
 
         # Runtime state
@@ -314,51 +252,38 @@ class STTPipeline:
             language=self._language,
             device=self._device,
             compute_type=self._compute_type,
-
-            # No microphone - audio fed via WebSocket
             use_microphone=False,
-
-            # Real-time transcription with our bridged callbacks
             enable_realtime_transcription=self._enable_realtime,
             realtime_processing_pause=self._realtime_pause,
-            init_realtime_after_seconds=self._realtime_init_delay,
             on_realtime_transcription_update=self._on_realtime_update,
             on_realtime_transcription_stabilized=self._on_realtime_stabilized,
-
-            # VAD config with our bridged callbacks
             silero_sensitivity=self._silero_sensitivity,
             webrtc_sensitivity=self._webrtc_sensitivity,
             post_speech_silence_duration=self._post_speech_silence,
             min_length_of_recording=self._min_recording_length,
-            pre_recording_buffer_duration=self._pre_recording_buffer,
             on_vad_start=self._on_vad_start,
             on_vad_stop=self._on_vad_stop,
-
-            # Recording callbacks
             on_recording_start=self._on_recording_start,
             on_recording_stop=self._on_recording_stop,
-
-            # Server-side settings
             spinner=False,
             no_log_file=True,
-
             **self._recorder_kwargs
         )
 
     async def start(self) -> None:
         """Start the STT service and initialize models."""
+
         if self._is_running:
-            logger.warning("STT service already running")
             return
 
         self._loop = asyncio.get_running_loop()
 
         logger.info("Initializing STT with model: %s", self._model)
-        self._recorder = await self._loop.run_in_executor(
-            None, self._create_recorder
-        )
+
+        self._recorder = await self._loop.run_in_executor(None, self._create_recorder)
 
         self._is_running = True
+
         logger.info("STT service started")
 
     async def stop(self) -> None:
@@ -377,7 +302,6 @@ class STTPipeline:
             except asyncio.CancelledError:
                 pass
 
-        # Shutdown recorder
         if self._recorder:
             await self._loop.run_in_executor(None, self._recorder.shutdown)
             self._recorder = None
@@ -422,7 +346,8 @@ class STTPipeline:
             logger.debug("Recording aborted")
 
     def set_tts_playing(self, playing: bool) -> None:
-        """Set TTS playback state for interrupt detection.When TTS is playing and VAD detects speech, an interrupt is flagged."""
+        """Set TTS playback state for interrupt detection."""
+
         with self._state_lock:
             self._tts_playing = playing
             if not playing:
@@ -430,25 +355,26 @@ class STTPipeline:
 
     def is_interrupt_detected(self) -> bool:
         """Check if user interrupted during TTS playback."""
+
         with self._state_lock:
             return self._interrupt_detected
 
     def clear_interrupt(self) -> None:
         """Clear the interrupt flag."""
+
         with self._state_lock:
             self._interrupt_detected = False
 
     def _invoke_callback(self, callback: Optional[Callback], *args) -> None:
-        """Invoke a user callback from a RealtimeSTT background thread. Handles both sync and async callbacks, bridging to the event loop when necessary."""
+        """Run a user callback from a RealtimeSTT background thread."""
 
         if callback is None or self._loop is None:
             return
 
         if asyncio.iscoroutinefunction(callback):
-            # Async callback - schedule on event loop
             asyncio.run_coroutine_threadsafe(callback(*args), self._loop)
+
         else:
-            # Sync callback - run thread-safe on event loop
             self._loop.call_soon_threadsafe(callback, *args)
 
     def _on_realtime_update(self, text: str) -> None:
@@ -489,15 +415,8 @@ class STTPipeline:
                 logger.error(f"Failed to feed audio to recorder: {e}")
 
     async def get_transcription(self) -> Optional[str]:
-        """
-        Wait for complete speech turn and return transcription.
+        """Wait for complete speech turn and return transcription."""
 
-        Pure data retrieval - no callbacks invoked. Use run_transcription_loop()
-        for continuous transcription with callback handling.
-
-        Returns:
-            Final transcription text, or None if not running/error occurred.
-        """
         if not self._is_running or not self._recorder:
             return None
 
@@ -505,7 +424,7 @@ class STTPipeline:
             self.start_listening()
 
         try:
-            # text() blocks until speech complete
+
             user_message = await self._loop.run_in_executor(None, self._recorder.text)
             return user_message
 
@@ -514,14 +433,8 @@ class STTPipeline:
             return None
 
     async def run_transcription_loop(self) -> None:
-        """
-        Run continuous transcription loop.
-
-        Orchestration layer that handles callbacks. Continuously listens and
-        transcribes, invoking on_final_transcription for each complete utterance.
-
-        Run this as a background task via start_transcription_loop().
-        """
+        """Run continuous transcription loop. Orchestration layer that handles callbacks."""
+        
         logger.info("Starting transcription loop")
 
         while self._is_running:
@@ -532,7 +445,7 @@ class STTPipeline:
                 user_message = await self.get_transcription()
 
                 if user_message:
-                    # Invoke callback here (orchestration layer handles side effects)
+
                     if self.callbacks.on_final_transcription:
                         self._invoke_callback(self.callbacks.on_final_transcription, user_message)
 
@@ -550,7 +463,6 @@ class STTPipeline:
         """Start the transcription loop as a background task. Returns the task so it can be cancelled if needed."""
 
         if self._transcription_task and not self._transcription_task.done():
-            logger.warning("Transcription loop already running")
             return self._transcription_task
 
         self._transcription_task = asyncio.create_task(self.run_transcription_loop())
@@ -568,8 +480,343 @@ class STTPipeline:
 class LLMPipeline:
     """LLM Service for multi-character conversation loop"""
 
-    async def conversation_loop(self):
+    def __init__(self, queues: Queues, api_key: str):
+
+        self.is_initialized = False
+        self.queues = queues
+        self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+
+        self.active_characters: List[Character] = []
+        self.conversation_history: List[Dict[str, str]] = []
+        self.model_settings: Optional[ModelSettings] = None
+
+        # Per-response tracking (reset for each character response)
+        self.chunk_index = 0
+        self.index = 0
+        self.response_text = ""
+        self.is_complete = False
+
+        self.interrupt_event = asyncio.Event()
+
+    async def initialize(self):
+        self.is_initialized = True
+        logger.info("LLMService initialized")
+
+    def strip_character_tags(self, text: str) -> str:
+        """Strip character tags from text for display/TTS purposes"""
+        return re.sub(r'<[^>]+>', '', text).strip()
+
+    def add_user_message(self, content: str, name: str = "User"):
+        """Add user message to conversation history"""
+
+        self.conversation_history.append({
+            "role": "user",
+            "name": name,
+            "content": content
+        })
+
+    def add_character_message(self, character: Character, content: str):
+        """Add character response to conversation history"""
+
+        self.conversation_history.append({
+            "role": "assistant",
+            "name": character.name,
+            "content": content
+        })
+
+    def add_message_to_conversation_history(self, role: str, name: str, content: str):
+        """Add (user or character) message to conversation history"""
+
+        self.conversation_history.append({
+            "role": role,
+            "name": name,
+            "content": content
+        })
+
+    def set_active_characters(self, characters: List[Character]):
+        """Set the active characters for the conversation"""
+
+        self.active_characters = characters
+
+    async def load_active_characters_from_db(self):
+        """Load active characters from Supabase database"""
+        try:
+            logger.info("Loading active characters from database...")
+
+            response = supabase.table("characters") \
+                .select("*") \
+                .eq("is_active", True) \
+                .execute()
+
+            if response.data:
+                characters = [
+                    Character(
+                        id=char.get("id", str(uuid.uuid4())),
+                        name=char.get("name", ""),
+                        voice=char.get("voice", ""),
+                        system_prompt=char.get("system_prompt", ""),
+                        image_url=char.get("image_url", ""),
+                        images=char.get("images", []),
+                        is_active=char.get("is_active", True)
+                    )
+                    for char in response.data
+                ]
+
+                self.set_active_characters(characters)
+                logger.info(f"✅ Loaded {len(characters)} active characters: {[c.name for c in characters]}")
+                return characters
+            else:
+                logger.info("No active characters found in database")
+                self.set_active_characters([])
+                return []
+
+        except Exception as e:
+            logger.error(f"Failed to load active characters from database: {e}")
+            return []
+
+    def set_model_settings(self, model_settings: ModelSettings):
+        """Set model settings for LLM requests"""
+
+        self.model_settings = model_settings
+
+    def clear_conversation_history(self):
+        """Clear the conversation history"""
+
+        self.conversation_history = []
+
+    def reset_response_tracking(self):
+        """Reset per-response tracking variables"""
+        self.chunk_index = 0
+        self.index = 0
+        self.response_text = ""
+        self.is_complete = False
+
+    def create_character_instruction_message(self, character: Character) -> Dict[str, str]:
+        """Create character instruction message for group chat with character tags."""
+
+        return {
+            'role': 'system',
+            'content': f'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}\'s reply. Do not respond for/as anyone else. Wrap your entire response in <{character.name}></{character.name}> tags.'
+        }
+
+    def parse_character_mentions(self, message: str, active_characters: List[Character]) -> List[Character]:
+        """Parse a message for character mentions in order of appearance"""
+
+        mentioned_characters = []
+        processed_characters = set()
+
+        name_mentions = []
+
+        for character in active_characters:
+            name_parts = character.name.lower().split()
+
+            for name_part in name_parts:
+                pattern = r'\b' + re.escape(name_part) + r'\b'
+                for match in re.finditer(pattern, message, re.IGNORECASE):
+                    name_mentions.append({
+                        'character': character,
+                        'position': match.start(),
+                        'name_part': name_part
+                    })
+
+        name_mentions.sort(key=lambda x: x['position'])
+
+        for mention in name_mentions:
+            if mention['character'].id not in processed_characters:
+                mentioned_characters.append(mention['character'])
+                processed_characters.add(mention['character'].id)
+
+        if not mentioned_characters:
+            mentioned_characters = sorted(active_characters, key=lambda c: c.name)
+
+        return mentioned_characters
+    
+    def get_model_settings(self) -> ModelSettings:
+        """Get current model settings for the LLM request"""
+        if self.model_settings is None:
+            # Return default settings if not set
+            return ModelSettings(
+                model="meta-llama/llama-3.1-8b-instruct",
+                temperature=0.7,
+                top_p=0.9,
+                min_p=0.0,
+                top_k=40,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                repetition_penalty=1.0
+            )
+        return self.model_settings
+
+    async def conversation_loop(self, message: str, active_characters: List[Character], user_name: str = "Jay", model_settings: ModelSettings = None,):
         """Main LLM conversation loop for multi-character conversations."""
+
+        logger.info("Starting main LLM loop")
+
+        while True:
+            try:
+
+                user_message = await self.queues.transcribe_queue.get()
+
+                if not user_message or not user_message.strip():
+                    continue
+
+                self.conversation_history.append({"role": "user", "name": user_name, "content": user_message})
+
+                mentioned_characters = self.parse_character_mentions(message=user_message, active_characters=self.active_characters)
+
+                for character in mentioned_characters:
+                    if self.interrupt_event.is_set():
+                        break
+
+                    messages = []
+
+                    messages.append({"role": "system", "name": character.name, "content": character.system_prompt})
+
+                    messages.extend(self.conversation_history)
+
+                    messages.append(self.create_character_instruction_message(character))
+
+                    model_settings = self.get_model_settings()
+
+                    text_stream = await self.client.chat.completions.create(
+                        model=model_settings.model,
+                        messages=messages,
+                        temperature=model_settings.temperature,
+                        top_p=model_settings.top_p,
+                        frequency_penalty=model_settings.frequency_penalty,
+                        presence_penalty=model_settings.presence_penalty,
+                        stream=True
+                    )
+
+                    response_text = await self.character_response_stream(character=character, text_stream=text_stream)
+
+                    if response_text:
+                        self.conversation_history.append({"role": "assistant", "name": character.name, "content": response_text})
+
+            except Exception as e:
+                logger.error(f"Error in LLM loop: {e}")
+
+    async def character_response_stream(self, character: Character, text_stream: AsyncIterator) -> str:
+        """Generate and stream a single character's response."""
+
+        message_id = f"msg-{character.id}-{int(time.time() * 1000)}"
+
+        try:
+
+            async for chunk in text_stream:
+                if self.interrupt_event.is_set():
+                    logger.info(f"Interrupt detected during {character.name}'s response")
+                    break
+
+                # Extract content from chunk
+                content = chunk.choices[0].delta.content
+                if content:
+                    self.response_text += content
+
+                    # Stream to UI immediately
+                    response_chunk = TextChunk(text=content, message_id=message_id, character_name=character.name, 
+                                               chunk_index=self.chunk_index, is_final=False, timestamp=time.time())
+                    
+                    await self.queues.response_queue.put(response_chunk)
+                    self.chunk_index += 1
+
+            # Send final text chunk to UI
+            response_text = TextChunk(text="", message_id=message_id, character_name=character.name, 
+                                      chunk_index=self.chunk_index, is_final=True, timestamp=time.time())
+            
+            await self.queues.response_queue.put(response_text)
+
+        except Exception as e:
+            logger.error(f"Error in character_response_stream for {character.name}: {e}")
+
+        return self.response_text
+
+    async def process_sentences_for_tts(self, character: Character, message_id: str):
+        """Process sentences as they're extracted and queue for TTS. Runs concurrently with LLM text stream.
+            This is to be removed, only here as reminder.
+        """
+
+        sentences = []
+        index = 0
+
+        try:
+            async for sentence, index in self.sentence_extractor.get_sentences():
+                
+                if self.interrupt_event.is_set():
+                    break
+
+                sentences.append(sentence)
+
+                # Queue for TTS immediately
+                sentence = TTSChunk(
+                    text=sentence,
+                    message_id=message_id,
+                    character=character,
+                    voice=Voice,
+                    index=index,
+                    is_final=False,
+                    timestamp=time.time()
+                )
+                await self.queues.sentence_queue.put(sentence)
+
+                logger.info(f"Sentence {index} queued for TTS ({character.name}): "
+                           f"{sentence[:50]}{'...' if len(sentence) > 50 else ''}")
+
+                index += 1
+
+            # Send final marker for this character's TTS
+            if sentences:
+                final_marker = TTSChunk(
+                    text="",
+                    message_id=message_id,
+                    character=character,
+                    voice=Voice,
+                    index=index,
+                    is_final=True,
+                    timestamp=time.time()
+                )
+                await self.queues.sentence_queue.put(final_marker)
+
+        except Exception as e:
+            logger.error(f"Error processing sentences for {character.name}: {e}")
+
+
+async def extract_text_deltas(self, text_stream: AsyncIterator) -> AsyncIterator[str]:
+    """Extract text content from text stream."""
+
+    async for chunk in text_stream:
+        if chunk.choices:
+            content = chunk.choices[0].delta.content
+            if content:
+                self.response_text += content
+
+async def produce_sentences_to_queue(text_stream: AsyncIterator[str], sentence_queue: asyncio.Queue[Sentence], min_first_fragment_length: int = 10, min_sentence_length: int = 20) -> int:
+    """Generate sentences from a text stream and queue them for TTS."""
+
+    index = 0
+
+    try:
+        async for sentence in generate_sentences_async(
+            text_stream,
+            minimum_first_fragment_length=min_first_fragment_length,
+            minimum_sentence_length=min_sentence_length,
+            cleanup_text_emojis=True,
+        ):
+            sentence = sentence.strip()
+            if sentence:
+                sentence = Sentence(sentence, index)
+                await sentence_queue.put(sentence)
+                logger.info("Queued sentence %d: %.50s...", index, sentence)
+                index += 1
+
+    except Exception as e:
+        logger.exception("Error in sentence producer")
+
+    finally:
+        await sentence_queue.put(""(total_sentences=index))
+        logger.info("Sentence producer complete: %d sentences", index)
+
+    return index
 
 ########################################
 ##--           TTS Service          --##
