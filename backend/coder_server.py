@@ -713,93 +713,6 @@ class LLMPipeline:
 
         return self.response_text
 
-    async def process_sentences_for_tts(self, character: Character, message_id: str):
-        """Process sentences as they're extracted and queue for TTS. Runs concurrently with LLM text stream.
-            This is to be removed, only here as reminder.
-        """
-
-        sentences = []
-        index = 0
-
-        try:
-            async for sentence, index in self.sentence_extractor.get_sentences():
-                
-                if self.interrupt_event.is_set():
-                    break
-
-                sentences.append(sentence)
-
-                # Queue for TTS immediately
-                sentence = TTSChunk(
-                    text=sentence,
-                    message_id=message_id,
-                    character=character,
-                    voice=Voice,
-                    index=index,
-                    is_final=False,
-                    timestamp=time.time()
-                )
-                await self.queues.sentence_queue.put(sentence)
-
-                logger.info(f"Sentence {index} queued for TTS ({character.name}): "
-                           f"{sentence[:50]}{'...' if len(sentence) > 50 else ''}")
-
-                index += 1
-
-            # Send final marker for this character's TTS
-            if sentences:
-                final_marker = TTSChunk(
-                    text="",
-                    message_id=message_id,
-                    character=character,
-                    voice=Voice,
-                    index=index,
-                    is_final=True,
-                    timestamp=time.time()
-                )
-                await self.queues.sentence_queue.put(final_marker)
-
-        except Exception as e:
-            logger.error(f"Error processing sentences for {character.name}: {e}")
-
-
-async def extract_text_deltas(self, text_stream: AsyncIterator) -> AsyncIterator[str]:
-    """Extract text content from text stream."""
-
-    async for chunk in text_stream:
-        if chunk.choices:
-            content = chunk.choices[0].delta.content
-            if content:
-                self.response_text += content
-
-async def produce_sentences_to_queue(text_stream: AsyncIterator[str], sentence_queue: asyncio.Queue[Sentence], min_first_fragment_length: int = 10, min_sentence_length: int = 20) -> int:
-    """Generate sentences from a text stream and queue them for TTS."""
-
-    index = 0
-
-    try:
-        async for sentence in generate_sentences_async(
-            text_stream,
-            minimum_first_fragment_length=min_first_fragment_length,
-            minimum_sentence_length=min_sentence_length,
-            cleanup_text_emojis=True,
-        ):
-            sentence = sentence.strip()
-            if sentence:
-                sentence = Sentence(sentence, index)
-                await sentence_queue.put(sentence)
-                logger.info("Queued sentence %d: %.50s...", index, sentence)
-                index += 1
-
-    except Exception as e:
-        logger.exception("Error in sentence producer")
-
-    finally:
-        await sentence_queue.put(""(total_sentences=index))
-        logger.info("Sentence producer complete: %d sentences", index)
-
-    return index
-
 ########################################
 ##--           TTS Service          --##
 ########################################
@@ -1102,3 +1015,4 @@ app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
