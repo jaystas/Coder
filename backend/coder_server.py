@@ -31,6 +31,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable
 from stream2sentence import generate_sentences_async
+from sentence_stream_pipeline import (
+    produce_sentences_to_queue,
+    SentenceItem,
+    StreamComplete,
+    StreamError,
+    SentenceQueueItem
+)
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
 from loguru import logger
@@ -630,61 +637,148 @@ class LLMPipeline:
         return self.model_settings
 
     async def conversation_loop(self, message: str, active_characters: List[Character], user_name: str = "Jay", model_settings: ModelSettings = None,):
-        """Main LLM conversation loop for multi-character conversations."""
+        """
+        Main LLM conversation loop for multi-character conversations.
 
-        logger.info("Starting main LLM loop")
+        This runs continuously, waiting for messages from transcribe_queue.
+        For each message, it generates responses from mentioned characters,
+        streaming text to UI and sentences to TTS concurrently.
+        """
+        logger.info("Starting main LLM conversation loop")
 
         while True:
             try:
-
+                # Wait for next user message from transcription
                 user_message = await self.queues.transcribe_queue.get()
 
                 if not user_message or not user_message.strip():
                     continue
 
-                self.conversation_history.append({"role": "user", "name": user_name, "content": user_message})
+                # Clear any previous interrupt before processing new message
+                self.interrupt_event.clear()
 
-                mentioned_characters = self.parse_character_mentions(message=user_message, active_characters=self.active_characters)
+                logger.info(f"Processing user message: {user_message[:50]}...")
 
+                self.conversation_history.append({
+                    "role": "user",
+                    "name": user_name,
+                    "content": user_message
+                })
+
+                # Determine which characters to respond
+                mentioned_characters = self.parse_character_mentions(
+                    message=user_message,
+                    active_characters=self.active_characters
+                )
+
+                logger.debug(f"Characters responding: {[c.name for c in mentioned_characters]}")
+
+                # Generate response from each mentioned character
                 for character in mentioned_characters:
+                    # Check for interrupt before each character
                     if self.interrupt_event.is_set():
+                        logger.info(f"Interrupt detected, skipping remaining characters")
                         break
 
-                    messages = []
+                    # Reset per-response tracking
+                    self.reset_response_tracking()
 
-                    messages.append({"role": "system", "name": character.name, "content": character.system_prompt})
-
+                    # Build messages for this character
+                    messages = [
+                        {"role": "system", "name": character.name, "content": character.system_prompt}
+                    ]
                     messages.extend(self.conversation_history)
-
                     messages.append(self.create_character_instruction_message(character))
 
-                    model_settings = self.get_model_settings()
+                    # Get model settings
+                    current_settings = self.get_model_settings()
 
+                    # Create streaming completion
                     text_stream = await self.client.chat.completions.create(
-                        model=model_settings.model,
+                        model=current_settings.model,
                         messages=messages,
-                        temperature=model_settings.temperature,
-                        top_p=model_settings.top_p,
-                        frequency_penalty=model_settings.frequency_penalty,
-                        presence_penalty=model_settings.presence_penalty,
+                        temperature=current_settings.temperature,
+                        top_p=current_settings.top_p,
+                        frequency_penalty=current_settings.frequency_penalty,
+                        presence_penalty=current_settings.presence_penalty,
                         stream=True
                     )
 
-                    response_text = await self.character_response_stream(character=character, text_stream=text_stream)
+                    # Stream response (fans out to UI and TTS concurrently)
+                    response_text = await self.character_response_stream(
+                        character=character,
+                        text_stream=text_stream
+                    )
 
-                    if response_text:
-                        self.conversation_history.append({"role": "assistant", "name": character.name, "content": response_text})
+                    # Add to conversation history if we got a response
+                    if response_text and not self.interrupt_event.is_set():
+                        self.conversation_history.append({
+                            "role": "assistant",
+                            "name": character.name,
+                            "content": response_text
+                        })
 
+                # Clear interrupt flag after processing (ready for next message)
+                self.interrupt_event.clear()
+
+            except asyncio.CancelledError:
+                logger.info("LLM conversation loop cancelled")
+                break
             except Exception as e:
-                logger.error(f"Error in LLM loop: {e}")
+                logger.error(f"Error in LLM conversation loop: {e}", exc_info=True)
+                # Clear interrupt on error to allow recovery
+                self.interrupt_event.clear()
+                await asyncio.sleep(0.1)  # Brief pause before retrying
+
+    async def _text_chunk_generator(self, chunk_queue: asyncio.Queue) -> AsyncIterator[str]:
+        """
+        Async generator that yields text chunks from an internal queue.
+        Used to feed the sentence producer from the main stream consumer.
+        """
+        while True:
+            item = await chunk_queue.get()
+            if item is None:  # Sentinel to signal end of stream
+                break
+            yield item
 
     async def character_response_stream(self, character: Character, text_stream: AsyncIterator) -> str:
-        """Generate and stream a single character's response."""
+        """
+        Generate and stream a single character's response with concurrent sentence processing.
 
+        Architecture (Fan-Out Pattern):
+        1. Consume OpenAI stream in main loop
+        2. Send chunks to UI via response_queue (immediate display)
+        3. Feed chunks to sentence producer via internal queue (concurrent TTS prep)
+        4. Sentence producer runs as background task, populating sentence_queue
+
+        This enables ultra-low latency: first sentence can start TTS synthesis
+        while LLM is still generating subsequent text.
+        """
         message_id = f"msg-{character.id}-{int(time.time() * 1000)}"
 
-        try:
+        # Internal queue for fan-out: feeds the sentence producer
+        text_chunk_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
 
+        # Track the sentence producer task
+        sentence_producer_task: Optional[asyncio.Task] = None
+
+        try:
+            # Start sentence producer as concurrent background task
+            # This consumes from text_chunk_queue and produces to sentence_queue
+            sentence_producer_task = asyncio.create_task(
+                produce_sentences_to_queue(
+                    text_stream=self._text_chunk_generator(text_chunk_queue),
+                    sentence_queue=self.queues.sentence_queue,
+                    quick_yield=True,
+                    min_first_fragment_length=10,
+                    min_sentence_length=10,
+                ),
+                name=f"sentence_producer_{character.name}"
+            )
+
+            logger.debug(f"Started sentence producer task for {character.name}")
+
+            # Main stream consumption loop - fan out to UI and sentence producer
             async for chunk in text_stream:
                 if self.interrupt_event.is_set():
                     logger.info(f"Interrupt detected during {character.name}'s response")
@@ -695,21 +789,54 @@ class LLMPipeline:
                 if content:
                     self.response_text += content
 
-                    # Stream to UI immediately
-                    response_chunk = TextChunk(text=content, message_id=message_id, character_name=character.name, 
-                                               chunk_index=self.chunk_index, is_final=False, timestamp=time.time())
-                    
+                    # Fan-out #1: Stream to UI immediately via response_queue
+                    response_chunk = TextChunk(
+                        text=content,
+                        message_id=message_id,
+                        character_name=character.name,
+                        chunk_index=self.chunk_index,
+                        is_final=False,
+                        timestamp=time.time()
+                    )
                     await self.queues.response_queue.put(response_chunk)
                     self.chunk_index += 1
 
-            # Send final text chunk to UI
-            response_text = TextChunk(text="", message_id=message_id, character_name=character.name, 
-                                      chunk_index=self.chunk_index, is_final=True, timestamp=time.time())
-            
-            await self.queues.response_queue.put(response_text)
+                    # Fan-out #2: Feed to sentence producer (for TTS processing)
+                    await text_chunk_queue.put(content)
+
+            # Signal end of stream to sentence producer
+            await text_chunk_queue.put(None)
+
+            # Send final text chunk marker to UI
+            final_chunk = TextChunk(
+                text="",
+                message_id=message_id,
+                character_name=character.name,
+                chunk_index=self.chunk_index,
+                is_final=True,
+                timestamp=time.time()
+            )
+            await self.queues.response_queue.put(final_chunk)
+
+            # Wait for sentence producer to complete (with timeout for safety)
+            if sentence_producer_task:
+                try:
+                    await asyncio.wait_for(sentence_producer_task, timeout=5.0)
+                    logger.debug(f"Sentence producer completed for {character.name}")
+                except asyncio.TimeoutError:
+                    logger.warning(f"Sentence producer timed out for {character.name}")
+                    sentence_producer_task.cancel()
 
         except Exception as e:
             logger.error(f"Error in character_response_stream for {character.name}: {e}")
+            # Ensure sentence producer is cleaned up on error
+            if sentence_producer_task and not sentence_producer_task.done():
+                await text_chunk_queue.put(None)  # Signal end
+                sentence_producer_task.cancel()
+                try:
+                    await sentence_producer_task
+                except asyncio.CancelledError:
+                    pass
 
         return self.response_text
 
@@ -718,10 +845,145 @@ class LLMPipeline:
 ########################################
 
 class TTSPipeline:
-    """Higgs Streaming"""
+    """
+    Text-to-Speech Pipeline for low-latency audio generation.
 
-    async def speech_loop(self):
-        """Main audio generation loop for character speech"""
+    Consumes sentences from sentence_queue and synthesizes audio.
+    Designed for concurrent processing - starts TTS on first sentence
+    while LLM is still generating subsequent sentences.
+    """
+
+    def __init__(self, queues: Queues):
+        self.queues = queues
+        self.is_running = False
+        self.is_speaking = False
+
+        # Callback for sending audio to client (set by WebSocketManager)
+        self.send_audio_callback: Optional[Callable[[bytes], Awaitable[None]]] = None
+
+        # Interrupt handling
+        self.interrupt_event = asyncio.Event()
+
+        # TTS engine will be integrated here
+        # self.tts_engine = None
+
+    async def initialize(self):
+        """Initialize TTS engine and resources."""
+        self.is_running = True
+        logger.info("TTSPipeline initialized")
+        # TODO: Initialize TTS engine (Kokoro, OpenAI, etc.)
+
+    async def shutdown(self):
+        """Cleanup TTS resources."""
+        self.is_running = False
+        self.interrupt_event.set()
+        logger.info("TTSPipeline shutdown")
+
+    def set_speaking(self, speaking: bool):
+        """Track speaking state for interrupt detection."""
+        self.is_speaking = speaking
+
+    def interrupt(self):
+        """Signal to interrupt current speech."""
+        self.interrupt_event.set()
+
+    def clear_interrupt(self):
+        """Clear interrupt flag."""
+        self.interrupt_event.clear()
+
+    async def synthesize_sentence(self, sentence: str) -> Optional[bytes]:
+        """
+        Synthesize a single sentence to audio.
+
+        Args:
+            sentence: Text to synthesize
+
+        Returns:
+            PCM audio bytes (24kHz, mono, 16-bit) or None on failure
+
+        TODO: Integrate with actual TTS engine (Kokoro, OpenAI, etc.)
+        """
+        # Placeholder - TTS engine integration goes here
+        # Example with a hypothetical TTS engine:
+        # audio_data = await self.tts_engine.synthesize(sentence)
+        # return audio_data
+
+        logger.debug(f"TTS synthesize (placeholder): {sentence[:50]}...")
+        return None
+
+    async def speech_loop(self, send_audio_callback: Optional[Callable[[bytes], Awaitable[None]]] = None):
+        """
+        Main audio generation loop - consumes sentence_queue, produces audio.
+
+        This runs as a concurrent background task. It:
+        1. Waits for sentences from sentence_queue
+        2. Synthesizes each sentence to audio
+        3. Sends audio to client via callback
+        4. Handles stream completion and errors
+
+        The producer/consumer pattern enables overlapped processing:
+        - First sentence starts TTS while LLM generates more text
+        - Subsequent sentences queue up for synthesis
+        - Audio plays continuously with minimal gaps
+
+        Args:
+            send_audio_callback: Async function to send audio bytes to client
+        """
+        self.send_audio_callback = send_audio_callback
+
+        logger.info("TTS speech_loop started - consuming from sentence_queue")
+
+        while self.is_running:
+            try:
+                # Wait for next sentence from queue
+                item: SentenceQueueItem = await self.queues.sentence_queue.get()
+
+                # Handle stream completion sentinel
+                if isinstance(item, StreamComplete):
+                    logger.debug(f"TTS: Stream complete, processed {item.total_sentences} sentences")
+                    self.set_speaking(False)
+                    continue
+
+                # Handle stream error sentinel
+                if isinstance(item, StreamError):
+                    logger.error(f"TTS: Stream error received: {item.exception}")
+                    self.set_speaking(False)
+                    continue
+
+                # Process sentence item
+                if isinstance(item, SentenceItem):
+                    # Check for interrupt before processing
+                    if self.interrupt_event.is_set():
+                        logger.info("TTS: Interrupt detected, skipping sentence")
+                        self.clear_interrupt()
+                        continue
+
+                    self.set_speaking(True)
+
+                    logger.info(f"TTS: Processing sentence {item.index}: {item.text[:50]}...")
+
+                    # Synthesize sentence to audio
+                    audio_data = await self.synthesize_sentence(item.text)
+
+                    # Send audio to client if callback provided and synthesis succeeded
+                    if audio_data and self.send_audio_callback:
+                        # Check for interrupt before sending
+                        if not self.interrupt_event.is_set():
+                            await self.send_audio_callback(audio_data)
+                        else:
+                            logger.info("TTS: Interrupt detected, discarding audio")
+
+                    # Mark item as processed
+                    self.queues.sentence_queue.task_done()
+
+            except asyncio.CancelledError:
+                logger.info("TTS speech_loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"TTS speech_loop error: {e}")
+                await asyncio.sleep(0.1)  # Brief pause before retrying
+
+        logger.info("TTS speech_loop ended")
 
 ########################################
 ##--        WebSocket Manager       --##
@@ -780,14 +1042,52 @@ class WebSocketManager:
         await self.start_service_tasks()
 
     async def start_service_tasks(self):
-        """Start all services"""
+        """
+        Start all concurrent service tasks.
 
+        Pipeline Architecture (Producer/Consumer Pattern):
+
+        ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+        │ STT Pipeline│───>│ LLM Pipeline│───>│ TTS Pipeline│───>│ Audio Stream│
+        │ (transcribe)│    │ (generate)  │    │ (synthesize)│    │ (playback)  │
+        └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+               │                  │                  │
+               v                  v                  v
+        transcribe_queue    response_queue     sentence_queue
+                              + sentence_queue
+
+        Concurrent Processing:
+        - STT runs continuously, feeding transcriptions
+        - LLM streams responses, fanning out to UI AND sentence producer
+        - TTS consumes sentences as they arrive (doesn't wait for full response)
+        - UI receives text chunks immediately for display
+        """
         self.service_tasks = [
-            asyncio.create_task(self.stt_pipeline.start_transcription_loop()),
-            asyncio.create_task(self.llm_pipeline.conversation_loop()),
-            asyncio.create_task(self.tts_pipeline.speech_loop(send_audio_callback=self.stream_audio_to_client)),
-            asyncio.create_task(self.stream_text_to_client())
+            # STT: start_transcription_loop() already returns a Task
+            self.stt_pipeline.start_transcription_loop(),
+            # LLM: runs conversation loop, fans out to response_queue and sentence_queue
+            asyncio.create_task(
+                self.llm_pipeline.conversation_loop(
+                    message="",  # Not used - waits for queue
+                    active_characters=self.llm_pipeline.active_characters
+                ),
+                name="llm_conversation_loop"
+            ),
+            # TTS: consumes sentence_queue, synthesizes audio, sends to client
+            asyncio.create_task(
+                self.tts_pipeline.speech_loop(
+                    send_audio_callback=self.stream_audio_to_client
+                ),
+                name="tts_speech_loop"
+            ),
+            # UI: streams text chunks to WebSocket for display
+            asyncio.create_task(
+                self.stream_text_to_client(),
+                name="text_stream_to_client"
+            )
         ]
+
+        logger.info(f"Started {len(self.service_tasks)} concurrent service tasks")
 
     async def shutdown(self):
         """Shutdown all services gracefully"""
@@ -877,10 +1177,9 @@ class WebSocketManager:
                 logger.info("Conversation history cleared")
 
             elif message_type == "interrupt":
-                # Signal interrupt to stop current generation
-                if self.llm_pipeline:
-                    self.llm_pipeline.interrupt_event.set()
-                logger.info("Interrupt signal sent")
+                # Signal interrupt to stop current generation and TTS
+                await self.handle_interrupt()
+                logger.info("Interrupt signal sent to LLM and TTS")
 
             elif message_type == "refresh_active_characters":
                 # Refresh active characters from database
@@ -903,6 +1202,41 @@ class WebSocketManager:
     async def handle_user_message(self, user_message: str):
         """Process manually sent user message"""
         await self.queues.transcribe_queue.put(user_message)
+
+    async def handle_interrupt(self):
+        """
+        Handle user interrupt - stop LLM generation and TTS playback.
+
+        Clears:
+        - LLM generation (sets interrupt_event)
+        - TTS synthesis (sets interrupt_event)
+        - Pending sentences in queue (drains sentence_queue)
+        """
+        # Signal LLM to stop generating
+        if self.llm_pipeline:
+            self.llm_pipeline.interrupt_event.set()
+
+        # Signal TTS to stop speaking
+        if self.tts_pipeline:
+            self.tts_pipeline.interrupt()
+
+        # Drain the sentence queue to discard pending sentences
+        if self.queues:
+            drained_count = 0
+            while not self.queues.sentence_queue.empty():
+                try:
+                    self.queues.sentence_queue.get_nowait()
+                    drained_count += 1
+                except asyncio.QueueEmpty:
+                    break
+            if drained_count > 0:
+                logger.debug(f"Drained {drained_count} sentences from queue on interrupt")
+
+        # Send interrupt confirmation to client
+        await self.send_text_to_client({
+            "type": "interrupted",
+            "timestamp": time.time()
+        })
 
     async def stream_text_to_client(self):
         """Stream response/text chunks from response_queue to WebSocket"""
