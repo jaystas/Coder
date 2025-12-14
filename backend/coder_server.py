@@ -414,24 +414,6 @@ class STTPipeline:
             except Exception as e:
                 logger.error(f"Failed to feed audio to recorder: {e}")
 
-    async def get_transcription(self) -> Optional[str]:
-        """Wait for complete speech turn and return transcription."""
-
-        if not self._is_running or not self._recorder:
-            return None
-
-        if not self._is_listening:
-            self.start_listening()
-
-        try:
-
-            user_message = await self._loop.run_in_executor(None, self._recorder.text)
-            return user_message
-
-        except Exception as e:
-            logger.error("Transcription error: %s", e)
-            return None
-
     async def run_transcription_loop(self) -> None:
         """Run continuous transcription loop. Orchestration layer that handles callbacks."""
         
@@ -442,7 +424,7 @@ class STTPipeline:
                 if not self._is_listening:
                     self.start_listening()
 
-                user_message = await self.get_transcription()
+                user_message = await self._loop.run_in_executor(None, self._recorder.text)
 
                 if user_message:
 
@@ -888,7 +870,7 @@ class WebSocketManager:
         """Start all services"""
 
         self.service_tasks = [
-            asyncio.create_task(self.stt_pipeline.run_transcription_loop()),
+            asyncio.create_task(self.stt_pipeline.start_transcription_loop()),
             asyncio.create_task(self.llm_pipeline.conversation_loop()),
             asyncio.create_task(self.tts_pipeline.speech_loop(send_audio_callback=self.stream_audio_to_client)),
             asyncio.create_task(self.stream_text_to_client())
