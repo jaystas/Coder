@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
-from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator
+from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable
 from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 from enum import Enum, auto
@@ -143,7 +143,6 @@ class Queues:
 ##--           STT Service          --##
 ########################################
 
-
 Callback = Callable[..., Optional[Awaitable[None]]]
 
 
@@ -164,7 +163,7 @@ class STTCallbacks:
     on_recording_stop: Optional[Callable[[], Any]] = None
 
 
-class STTService:
+class STTPipeline:
     """
     Async-compatible Speech-to-Text service for voice chat applications.
 
@@ -172,7 +171,7 @@ class STTService:
     to asyncio for use with FastAPI WebSocket handlers.
 
     Usage:
-        stt = STTService(
+        stt = STTPipeline(
             on_realtime_update=lambda text: broadcast({"type": "partial", "text": text}),
             on_final_transcription=lambda text: llm_queue.put(text),
             on_vad_start=handle_interrupt,
@@ -385,7 +384,7 @@ class STTService:
 
         logger.info("STT service stopped")
 
-    async def __aenter__(self) -> "STTService":
+    async def __aenter__(self) -> "STTPipeline":
         await self.start()
         return self
 
@@ -439,7 +438,6 @@ class STTService:
         with self._state_lock:
             self._interrupt_detected = False
 
-
     def set_callback(self, callback: Optional[Callback], *args) -> None:
         """Invoke a user callback from a RealtimeSTT background thread. Handles both sync and async callbacks, bridging to the event loop when necessary."""
 
@@ -489,7 +487,6 @@ class STTService:
                 self.recorder.feed_audio(audio_bytes, original_sample_rate=16000)
             except Exception as e:
                 logger.error(f"Failed to feed audio to recorder: {e}")
-
 
     async def get_transcription(self) -> Optional[str]:
         """Wait for complete speech turn and return transcription. Blocks until user finishes speaking (silence detected). Returns the final transcription text."""
@@ -551,595 +548,25 @@ class STTService:
         if self._transcription_task:
             self._transcription_task.cancel()
 
-
 ########################################
 ##--           LLM Service          --##
 ########################################
 
-class LLMService:
+class LLMPipeline:
     """LLM Service for multi-character conversation loop"""
 
-    def __init__(self, queues: Queues, api_key: str):
-
-        self.is_initialized = False
-        self.queues = queues
-        self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
-
-        # Active characters in the conversation
-        self.active_characters: List[Character] = []
-
-        self.conversation_history: List[Dict[str, str]] = []
-
-        # Current model settings (can be updated per request)
-        self.model_settings: Optional[ModelSettings] = None
-
-        # Per-response tracking (reset for each character response)
-        self.chunk_index = 0
-        self.index = 0
-        self.response_text = ""
-        self.is_complete = False
-
-        # Interrupt handling
-        self.interrupt_event = asyncio.Event()
-
-    async def initialize(self):
-        self.is_initialized = True
-        logger.info("LLMService initialized")
-
-    def strip_character_tags(self, text: str) -> str:
-        """Strip character tags from text for display/TTS purposes"""
-        return re.sub(r'<[^>]+>', '', text).strip()
-
-    def add_user_message(self, content: str, name: str = "User"):
-        """Add user message to conversation history"""
-        self.conversation_history.append({
-            "role": "user",
-            "name": name,
-            "content": content
-        })
-
-    def add_character_message(self, character: Character, content: str):
-        """Add character response to conversation history"""
-        self.conversation_history.append({
-            "role": "assistant",
-            "name": character.name,
-            "content": content
-        })
-
-    def add_message_to_conversation_history(self, role: str, name: str, content: str):
-        """Add (user or character) message to conversation history"""
-        self.conversation_history.append({
-            "role": role,
-            "name": name,
-            "content": content
-        })
-
-    def set_active_characters(self, characters: List[Character]):
-        """Set the active characters for the conversation"""
-        self.active_characters = characters
-
-    async def load_active_characters_from_db(self):
-        """Load active characters from Supabase database"""
-        try:
-            logger.info("Loading active characters from database...")
-
-            response = supabase.table("characters") \
-                .select("*") \
-                .eq("is_active", True) \
-                .execute()
-
-            if response.data:
-                characters = [
-                    Character(
-                        id=char.get("id", str(uuid.uuid4())),
-                        name=char.get("name", ""),
-                        voice=char.get("voice", ""),
-                        system_prompt=char.get("system_prompt", ""),
-                        image_url=char.get("image_url", ""),
-                        images=char.get("images", []),
-                        is_active=char.get("is_active", True)
-                    )
-                    for char in response.data
-                ]
-
-                self.set_active_characters(characters)
-                logger.info(f"✅ Loaded {len(characters)} active characters: {[c.name for c in characters]}")
-                return characters
-            else:
-                logger.info("No active characters found in database")
-                self.set_active_characters([])
-                return []
-
-        except Exception as e:
-            logger.error(f"Failed to load active characters from database: {e}")
-            return []
-
-    def set_model_settings(self, model_settings: ModelSettings):
-        """Set model settings for LLM requests"""
-        self.model_settings = model_settings
-
-    def clear_conversation_history(self):
-        """Clear the conversation history"""
-        self.conversation_history = []
-
-    def reset_response_tracking(self):
-        """Reset per-response tracking variables"""
-        self.chunk_index = 0
-        self.index = 0
-        self.response_text = ""
-        self.is_complete = False
-
-    def create_character_instruction_message(self, character: Character) -> Dict[str, str]:
-        """Create character instruction message for group chat with character tags."""
-        return {
-            'role': 'system',
-            'content': f'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}\'s reply. Do not respond for/as anyone else. Wrap your entire response in <{character.name}></{character.name}> tags.'
-        }
-
-    def parse_character_mentions(self, message: str, active_characters: List[Character]) -> List[Character]:
-        """Parse a message for character mentions in order of appearance"""
-        mentioned_characters = []
-        processed_characters = set()
-
-        name_mentions = []
-
-        for character in active_characters:
-            name_parts = character.name.lower().split()
-
-            for name_part in name_parts:
-                pattern = r'\b' + re.escape(name_part) + r'\b'
-                for match in re.finditer(pattern, message, re.IGNORECASE):
-                    name_mentions.append({
-                        'character': character,
-                        'position': match.start(),
-                        'name_part': name_part
-                    })
-
-        name_mentions.sort(key=lambda x: x['position'])
-
-        for mention in name_mentions:
-            if mention['character'].id not in processed_characters:
-                mentioned_characters.append(mention['character'])
-                processed_characters.add(mention['character'].id)
-
-        if not mentioned_characters:
-            mentioned_characters = sorted(active_characters, key=lambda c: c.name)
-
-        return mentioned_characters
-    
-    def get_model_settings(self) -> ModelSettings:
-        """Get current model settings for the LLM request"""
-        if self.model_settings is None:
-            # Return default settings if not set
-            return ModelSettings(
-                model="meta-llama/llama-3.1-8b-instruct",
-                temperature=0.7,
-                top_p=0.9,
-                min_p=0.0,
-                top_k=40,
-                frequency_penalty=0.0,
-                presence_penalty=0.0,
-                repetition_penalty=1.0
-            )
-        return self.model_settings
-
-    async def conversation_loop(self, user_name: str = "Jay"):
+    async def conversation_loop(self):
         """Main LLM conversation loop for multi-character conversations."""
-
-        logger.info("Starting main LLM loop")
-
-        while True:
-            try:
-
-                user_message = await self.queues.transcribe_queue.get()
-
-                if not user_message or not user_message.strip():
-                    continue
-
-                self.conversation_history.append({"role": "user", "name": user_name, "content": user_message})
-
-                mentioned_characters = self.parse_character_mentions(message=user_message, active_characters=self.active_characters)
-
-                for character in mentioned_characters:
-                    if self.interrupt_event.is_set():
-                        break
-
-                    messages = []
-
-                    messages.append({"role": "system", "name": character.name, "content": character.system_prompt})
-
-                    messages.extend(self.conversation_history)
-
-                    messages.append(self.create_character_instruction_message(character))
-
-                    model_settings = self.get_model_settings()
-
-                    text_stream = await self.client.chat.completions.create(
-                        model=model_settings.model,
-                        messages=messages,
-                        temperature=model_settings.temperature,
-                        top_p=model_settings.top_p,
-                        frequency_penalty=model_settings.frequency_penalty,
-                        presence_penalty=model_settings.presence_penalty,
-                        stream=True
-                    )
-
-                    response_text = await self.character_response_stream(character=character, text_stream=text_stream)
-
-                    if response_text:
-                        self.conversation_history.append({"role": "assistant", "name": character.name, "content": response_text})
-
-            except Exception as e:
-                logger.error(f"Error in LLM loop: {e}")
-
-    async def character_response_stream(self, character: Character, text_stream: AsyncIterator) -> str:
-        """Generate and stream a single character's response."""
-
-        message_id = f"msg-{character.id}-{int(time.time() * 1000)}"
-
-        try:
-            # Stream from LLM
-            async for chunk in text_stream:
-                # Check for interrupt
-                if self.interrupt_event.is_set():
-                    logger.info(f"Interrupt detected during {character.name}'s response")
-                    break
-
-                # Extract content from chunk
-                content = chunk.choices[0].delta.content
-                if content:
-                    self.response_text += content
-
-                    # Stream to UI immediately
-                    response_chunk = TextChunk(text=content, message_id=message_id, character_name=character.name, 
-                                               chunk_index=self.chunk_index, is_final=False, timestamp=time.time())
-                    
-                    await self.queues.response_queue.put(response_chunk)
-                    self.chunk_index += 1
-
-            # Signal LLM stream complete
-            self.sentence_extractor.finish()
-
-            # Send final text chunk to UI
-            response_text = TextChunk(text="", message_id=message_id, character_name=character.name, 
-                                      chunk_index=self.chunk_index, is_final=True, timestamp=time.time())
-            
-            await self.queues.response_queue.put(response_text)
-
-        except Exception as e:
-            logger.error(f"Error in character_response_stream for {character.name}: {e}")
-            raise
-        finally:
-            if self.sentence_extractor:
-                self.sentence_extractor.shutdown()
-            self.is_complete = True
-
-        return self.response_text
-
-    async def process_sentences_for_tts(self, character: Character, message_id: str):
-        """
-        Process sentences as they're extracted and queue for TTS.
-        Runs concurrently with LLM text stream.
-
-        Args:
-            character: The character whose sentences are being processed
-            message_id: Unique ID for the current message
-        """
-        sentences = []
-        index = 0
-
-        try:
-            async for sentence, index in self.sentence_extractor.get_sentences():
-                # Check for interrupt
-                if self.interrupt_event.is_set():
-                    break
-
-                sentences.append(sentence)
-
-                # Queue for TTS immediately
-                sentence = TTSChunk(
-                    text=sentence,
-                    message_id=message_id,
-                    character=character,
-                    voice=Voice,
-                    index=index,
-                    is_final=False,
-                    timestamp=time.time()
-                )
-                await self.queues.sentence_queue.put(sentence)
-
-                logger.info(f"Sentence {index} queued for TTS ({character.name}): "
-                           f"{sentence[:50]}{'...' if len(sentence) > 50 else ''}")
-
-                index += 1
-
-            # Send final marker for this character's TTS
-            if sentences:
-                final_marker = TTSChunk(
-                    text="",
-                    message_id=message_id,
-                    character=character,
-                    voice=Voice,
-                    index=index,
-                    is_final=True,
-                    timestamp=time.time()
-                )
-                await self.queues.sentence_queue.put(final_marker)
-
-        except Exception as e:
-            logger.error(f"Error processing sentences for {character.name}: {e}")
 
 ########################################
 ##--           TTS Service          --##
 ########################################
 
-def revert_delay_pattern(data: torch.Tensor, start_idx: int = 0) -> torch.Tensor:
-    """Undo Higgs delay pattern so decoded frames line up."""
-    if data.ndim != 2:
-        raise ValueError('Expected 2D tensor from audio tokenizer')
-    if data.shape[1] - data.shape[0] < start_idx:
-        raise ValueError('Invalid start_idx for delay pattern reversion')
-
-    out = []
-    num_codebooks = data.shape[0]
-    for i in range(num_codebooks):
-        out.append(data[i:(i + 1), i + start_idx:(data.shape[1] - num_codebooks + 1 + i)])
-    return torch.cat(out, dim=0)
-
-class TTSService:
+class TTSPipeline:
     """Higgs Streaming"""
 
-    def __init__(self):
-        self.serve_engine = None
-        self.voice_dir = "/workspace/tts/Code/backend/voices"
-        self.sample_rate = 24000
-        self._initialized = False
-        self._engine_lock = Lock()
-        self._chunk_overlap_duration = 0.04  # 40ms crossfade
-        self._chunk_size = 16  # Tokens per streaming chunk
-        self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    def initialize(self):
-        """Initialize Higgs Audio TTS engine"""
-        if self._initialized:
-            return
-
-        logger.info("Initializing Higgs Audio TTS service...")
-
-        try:
-            from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(f"Using device: {device}")
-
-            self.serve_engine = HiggsAudioServeEngine(
-                model_name_or_path="bosonai/higgs-audio-v2-generation-3B-base",
-                audio_tokenizer_name_or_path="bosonai/higgs-audio-v2-tokenizer",
-                device=device
-            )
-
-            self._initialized = True
-            logger.info("Higgs Audio TTS service initialized successfully")
-
-        except Exception as e:
-            logger.error(f"Failed to initialize Higgs Audio TTS: {e}")
-            raise
-
-    def _load_voice_reference(self, voice: str):
-        """Load reference audio and text for voice cloning"""
-        from backend.boson_multimodal.data_types import Message, AudioContent
-
-        audio_path = os.path.join(self.voice_dir, f"{voice}.wav")
-        text_path = os.path.join(self.voice_dir, f"{voice}.txt")
-
-        if not os.path.exists(audio_path):
-            raise FileNotFoundError(f"Voice audio file not found: {audio_path}")
-        if not os.path.exists(text_path):
-            raise FileNotFoundError(f"Voice text file not found: {text_path}")
-
-        with open(text_path, 'r', encoding='utf-8') as f:
-            ref_text = f.read().strip()
-
-        # Build messages with reference audio (few-shot approach)
-        messages = [
-            Message(role="user", content=ref_text),
-            Message(role="assistant", content=AudioContent(audio_url=audio_path))
-        ]
-
-        return messages
-
-    async def stream_pcm_chunks(self, text: str, voice: str) -> AsyncIterator[bytes]:
-        """Stream PCM16 audio chunks using delta token streaming"""
-        from backend.boson_multimodal.data_types import ChatMLSample, Message
-
-        if not self._initialized:
-            raise RuntimeError("TTS Manager not initialized")
-
-        # Load voice reference messages
-        messages = self._load_voice_reference(voice)
-
-        # Add user message with text to generate
-        messages.append(Message(role="user", content=text))
-
-        # Create ChatML sample
-        chat_sample = ChatMLSample(messages=messages)
-
-        # Stream generation with delta tokens
-        try:
-            output = self.serve_engine.generate_delta_stream(
-                chat_ml_sample=chat_sample,
-                max_new_tokens=1024,
-                temperature=0.7,
-                top_p=0.95,
-                top_k=50,
-                stop_strings=['<|end_of_text|>', '<|eot_id|>'],
-                ras_win_len=7,
-                ras_win_max_num_repeat=2,
-                force_audio_gen=True,
-            )
-
-            # Initialize streaming state
-            audio_tokens: List[torch.Tensor] = []
-            audio_tensor: Optional[torch.Tensor] = None
-            seq_len = 0
-
-            # Crossfade setup
-            cross_fade_samples = int(self._chunk_overlap_duration * self.sample_rate)
-            fade_out = np.linspace(1, 0, cross_fade_samples) if cross_fade_samples > 0 else None
-            fade_in = np.linspace(0, 1, cross_fade_samples) if cross_fade_samples > 0 else None
-            prev_tail: Optional[np.ndarray] = None
-
-            with torch.inference_mode():
-                async for delta in output:
-                    # Skip if no audio tokens
-                    if delta.audio_tokens is None:
-                        continue
-
-                    # Check for end token (1025)
-                    if torch.all(delta.audio_tokens == 1025):
-                        break
-
-                    # Accumulate audio tokens
-                    audio_tokens.append(delta.audio_tokens[:, None])
-                    audio_tensor = torch.cat(audio_tokens, dim=-1)
-
-                    # Count sequence length (skip padding token 1024)
-                    if torch.all(delta.audio_tokens != 1024):
-                        seq_len += 1
-
-                    # Decode and yield when chunk size reached
-                    if seq_len > 0 and seq_len % self._chunk_size == 0:
-                        try:
-                            # Revert delay pattern and decode
-                            vq_code = (
-                                revert_delay_pattern(audio_tensor, start_idx=seq_len - self._chunk_size + 1)
-                                .clip(0, 1023)
-                                .to(self._device)
-                            )
-                            waveform_tensor = self.serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
-
-                            # Convert to numpy
-                            if isinstance(waveform_tensor, torch.Tensor):
-                                waveform_np = waveform_tensor.detach().cpu().numpy()
-                            else:
-                                waveform_np = np.asarray(waveform_tensor, dtype=np.float32)
-
-                            # Apply crossfade
-                            if prev_tail is None:
-                                # First chunk
-                                if cross_fade_samples > 0 and waveform_np.size > cross_fade_samples:
-                                    chunk_head = waveform_np[:-cross_fade_samples]
-                                    prev_tail = waveform_np[-cross_fade_samples:]
-                                else:
-                                    chunk_head = waveform_np
-                                    prev_tail = None
-
-                                if chunk_head.size > 0:
-                                    # Convert to PCM16 and yield
-                                    pcm = np.clip(chunk_head, -1.0, 1.0)
-                                    pcm16 = (pcm * 32767.0).astype(np.int16)
-                                    yield pcm16.tobytes()
-                            else:
-                                # Subsequent chunks with crossfade
-                                if cross_fade_samples > 0 and waveform_np.size >= cross_fade_samples:
-                                    overlap = prev_tail * fade_out + waveform_np[:cross_fade_samples] * fade_in
-                                    middle = (
-                                        waveform_np[cross_fade_samples:-cross_fade_samples]
-                                        if waveform_np.size > 2 * cross_fade_samples
-                                        else np.array([], dtype=waveform_np.dtype)
-                                    )
-                                    to_send = overlap if middle.size == 0 else np.concatenate([overlap, middle])
-
-                                    if to_send.size > 0:
-                                        # Convert to PCM16 and yield
-                                        pcm = np.clip(to_send, -1.0, 1.0)
-                                        pcm16 = (pcm * 32767.0).astype(np.int16)
-                                        yield pcm16.tobytes()
-
-                                    prev_tail = waveform_np[-cross_fade_samples:]
-                                else:
-                                    # Convert to PCM16 and yield
-                                    pcm = np.clip(waveform_np, -1.0, 1.0)
-                                    pcm16 = (pcm * 32767.0).astype(np.int16)
-                                    yield pcm16.tobytes()
-
-                        except Exception as e:
-                            # Skip errors and continue
-                            logger.warning(f"Error decoding audio chunk: {e}")
-                            continue
-
-            # Flush remaining tokens
-            if seq_len > 0 and seq_len % self._chunk_size != 0 and audio_tensor is not None:
-                try:
-                    vq_code = (
-                        revert_delay_pattern(audio_tensor, start_idx=seq_len - seq_len % self._chunk_size + 1)
-                        .clip(0, 1023)
-                        .to(self._device)
-                    )
-                    waveform_tensor = self.serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
-
-                    if isinstance(waveform_tensor, torch.Tensor):
-                        waveform_np = waveform_tensor.detach().cpu().numpy()
-                    else:
-                        waveform_np = np.asarray(waveform_tensor, dtype=np.float32)
-
-                    if prev_tail is None:
-                        pcm = np.clip(waveform_np, -1.0, 1.0)
-                        pcm16 = (pcm * 32767.0).astype(np.int16)
-                        yield pcm16.tobytes()
-                    else:
-                        if cross_fade_samples > 0 and waveform_np.size >= cross_fade_samples:
-                            overlap = prev_tail * fade_out + waveform_np[:cross_fade_samples] * fade_in
-                            rest = waveform_np[cross_fade_samples:]
-                            to_send = overlap if rest.size == 0 else np.concatenate([overlap, rest])
-
-                            pcm = np.clip(to_send, -1.0, 1.0)
-                            pcm16 = (pcm * 32767.0).astype(np.int16)
-                            yield pcm16.tobytes()
-                        else:
-                            pcm = np.clip(waveform_np, -1.0, 1.0)
-                            pcm16 = (pcm * 32767.0).astype(np.int16)
-                            yield pcm16.tobytes()
-                except Exception as e:
-                    logger.warning(f"Error flushing remaining audio: {e}")
-
-            # Yield final tail if exists
-            if prev_tail is not None and prev_tail.size > 0:
-                pcm = np.clip(prev_tail, -1.0, 1.0)
-                pcm16 = (pcm * 32767.0).astype(np.int16)
-                yield pcm16.tobytes()
-
-        except Exception as e:
-            logger.error(f"Error in TTS streaming: {e}")
-            raise
-
-    def get_available_voices(self):
-        """Get list of available voices in format expected by frontend"""
-        if not os.path.exists(self.voice_dir):
-            return []
-
-        voices = []
-        for file in os.listdir(self.voice_dir):
-            if file.endswith('.wav'):
-                voice = file[:-4]  # Remove .wav extension
-                # Only include if matching .txt file exists
-                if os.path.exists(os.path.join(self.voice_dir, f"{voice}.txt")):
-                    # Format: {id: "voice", name: "Voice Name"}
-                    display_name = voice.replace('_', ' ').title()
-                    voices.append({
-                        "id": voice,
-                        "name": display_name
-                    })
-
-        # Sort by display name
-        voices.sort(key=lambda v: v['name'])
-        return voices
-
-    def shutdown(self):
-        """Cleanup resources"""
-        logger.info('Shutting down TTS manager')
-        self.serve_engine = None
-        self._initialized = False
+    async def speech_loop(self):
+        """Main audio generation loop for character speech"""
 
 ########################################
 ##--        WebSocket Manager       --##
@@ -1149,9 +576,9 @@ class WebSocketManager:
     """Manages WebSocket connections and coordinates services"""
 
     def __init__(self):
-        self.stt_service: Optional[STTService] = None
-        self.llm_service: Optional[LLMService] = None
-        self.tts_service: Optional[TTSService] = None
+        self.stt_pipeline: Optional[STTPipeline] = None
+        self.llm_pipeline: Optional[LLMPipeline] = None
+        self.tts_pipeline: Optional[TTSPipeline] = None
         self.websocket: Optional[WebSocket] = None
         self.queues: Optional[Queues] = None
         self.service_tasks: List[asyncio.Task] = []
@@ -1173,21 +600,21 @@ class WebSocketManager:
 
 
         # Initialize STT service
-        self.stt_service = STTService()
-        self.stt_service.callbacks = stt_callbacks
-        self.stt_service.loop = asyncio.get_event_loop()
-        self.stt_service.initialize()
+        self.stt_pipeline = STTPipeline()
+        self.stt_pipeline.callbacks = stt_callbacks
+        self.stt_pipeline.loop = asyncio.get_event_loop()
+        self.stt_pipeline.initialize()
 
         # Initialize LLM service with queues and API key
-        self.llm_service = LLMService(
+        self.llm_pipeline = LLMPipeline(
             queues=self.queues,
             api_key=self.openrouter_api_key
         )
-        await self.llm_service.initialize()
+        await self.llm_pipeline.initialize()
 
         # Initialize TTS Service Manager with queues
-        self.tts_service = TTSService(queues=self.queues)
-        await self.tts_service.initialize()
+        self.tts_pipeline = TTSPipeline(queues=self.queues)
+        await self.tts_pipeline.initialize()
 
         logger.info("WebSocketManager initialized")
 
@@ -1198,8 +625,8 @@ class WebSocketManager:
         logger.info("WebSocket connected")
 
         # Load active characters from database on connection
-        if self.llm_service:
-            await self.llm_service.load_active_characters_from_db()
+        if self.llm_pipeline:
+            await self.llm_pipeline.load_active_characters_from_db()
 
         await self.start_service_tasks()
 
@@ -1207,8 +634,9 @@ class WebSocketManager:
         """Start all services"""
 
         self.service_tasks = [
-            asyncio.create_task(self.llm_service.conversation_loop()),
-            asyncio.create_task(self.tts_service.main_tts_loop(send_audio_callback=self.stream_audio_to_client)),
+            asyncio.create_task(self.stt_pipeline.transcription_loop()),
+            asyncio.create_task(self.llm_pipeline.conversation_loop()),
+            asyncio.create_task(self.tts_pipeline.speech_loop(send_audio_callback=self.stream_audio_to_client)),
             asyncio.create_task(self.stream_text_to_client())
         ]
 
@@ -1226,8 +654,8 @@ class WebSocketManager:
                     pass
 
         # Shutdown TTS service
-        if self.tts_service:
-            await self.tts_service.shutdown()
+        if self.tts_pipeline:
+            await self.tts_pipeline.shutdown()
 
         # Clear queues
         if self.queues:
@@ -1251,12 +679,12 @@ class WebSocketManager:
                 await self.handle_user_message(user_message)
 
             elif message_type == "start_listening":
-                if self.stt_service:
-                    self.stt_service.start_listening()
+                if self.stt_pipeline:
+                    self.stt_pipeline.start_listening()
 
             elif message_type == "stop_listening":
-                if self.stt_service:
-                    self.stt_service.stop_listening()
+                if self.stt_pipeline:
+                    self.stt_pipeline.stop_listening()
 
             elif message_type == "model_settings":
                 settings_data = payload
@@ -1270,8 +698,8 @@ class WebSocketManager:
                     presence_penalty=float(settings_data.get("presence_penalty", 0.0)),
                     repetition_penalty=float(settings_data.get("repetition_penalty", 1.0))
                 )
-                if self.llm_service:
-                    self.llm_service.set_model_settings(model_settings)
+                if self.llm_pipeline:
+                    self.llm_pipeline.set_model_settings(model_settings)
                 logger.info(f"Model settings updated: {model_settings.model}")
 
             elif message_type == "set_characters":
@@ -1289,26 +717,26 @@ class WebSocketManager:
                     )
                     for char in characters_data
                 ]
-                if self.llm_service:
-                    self.llm_service.set_active_characters(characters)
+                if self.llm_pipeline:
+                    self.llm_pipeline.set_active_characters(characters)
                 logger.info(f"Active characters set: {[c.name for c in characters]}")
 
             elif message_type == "clear_history":
                 # Clear conversation history
-                if self.llm_service:
-                    self.llm_service.clear_conversation_history()
+                if self.llm_pipeline:
+                    self.llm_pipeline.clear_conversation_history()
                 logger.info("Conversation history cleared")
 
             elif message_type == "interrupt":
                 # Signal interrupt to stop current generation
-                if self.llm_service:
-                    self.llm_service.interrupt_event.set()
+                if self.llm_pipeline:
+                    self.llm_pipeline.interrupt_event.set()
                 logger.info("Interrupt signal sent")
 
             elif message_type == "refresh_active_characters":
                 # Refresh active characters from database
-                if self.llm_service:
-                    await self.llm_service.load_active_characters_from_db()
+                if self.llm_pipeline:
+                    await self.llm_pipeline.load_active_characters_from_db()
                 logger.info("Active characters refreshed from database")
 
             elif message_type == "ping":
@@ -1320,8 +748,8 @@ class WebSocketManager:
 
     async def handle_audio_message(self, audio_data: bytes):
         """Feed audio for transcription"""
-        if self.stt_service:
-            self.stt_service.feed_audio(audio_data)
+        if self.stt_pipeline:
+            self.stt_pipeline.feed_audio(audio_data)
 
     async def handle_user_message(self, user_message: str):
         """Process manually sent user message"""
