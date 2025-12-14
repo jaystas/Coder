@@ -438,7 +438,7 @@ class STTPipeline:
         with self._state_lock:
             self._interrupt_detected = False
 
-    def set_callback(self, callback: Optional[Callback], *args) -> None:
+    def _invoke_callback(self, callback: Optional[Callback], *args) -> None:
         """Invoke a user callback from a RealtimeSTT background thread. Handles both sync and async callbacks, bridging to the event loop when necessary."""
 
         if callback is None or self._loop is None:
@@ -453,11 +453,11 @@ class STTPipeline:
 
     def _on_realtime_update(self, text: str) -> None:
         """RealtimeSTT callback: real-time transcription update."""
-        self.set_callback(self.callbacks.on_realtime_update, text)
+        self._invoke_callback(self.callbacks.on_realtime_update, text)
 
     def _on_realtime_stabilized(self, text: str) -> None:
         """RealtimeSTT callback: stabilized transcription."""
-        self.set_callback(self.callbacks.on_realtime_stabilized, text)
+        self._invoke_callback(self.callbacks.on_realtime_stabilized, text)
 
     def _on_vad_start(self) -> None:
         """RealtimeSTT callback: voice activity started."""
@@ -466,31 +466,38 @@ class STTPipeline:
                 self._interrupt_detected = True
                 logger.info("Interrupt detected: user speaking during TTS")
 
-        self.set_callback(self.callbacks.on_vad_start)
+        self._invoke_callback(self.callbacks.on_vad_start)
 
     def _on_vad_stop(self) -> None:
         """RealtimeSTT callback: voice activity stopped."""
-        self.set_callback(self.callbacks.on_vad_stop)
+        self._invoke_callback(self.callbacks.on_vad_stop)
 
     def _on_recording_start(self) -> None:
         """RealtimeSTT callback: recording started."""
-        self.set_callback(self.callbacks.on_recording_start)
+        self._invoke_callback(self.callbacks.on_recording_start)
 
     def _on_recording_stop(self) -> None:
         """RealtimeSTT callback: recording stopped."""
-        self.set_callback(self.callbacks.on_recording_stop)
+        self._invoke_callback(self.callbacks.on_recording_stop)
 
     def feed_audio(self, audio_bytes: bytes):
         """Feed raw PCM audio bytes (16kHz, 16-bit, mono)"""
-        if self.recorder:
+        if self._recorder:
             try:
-                self.recorder.feed_audio(audio_bytes, original_sample_rate=16000)
+                self._recorder.feed_audio(audio_bytes, original_sample_rate=16000)
             except Exception as e:
                 logger.error(f"Failed to feed audio to recorder: {e}")
 
     async def get_transcription(self) -> Optional[str]:
-        """Wait for complete speech turn and return transcription. Blocks until user finishes speaking (silence detected). Returns the final transcription text."""
+        """
+        Wait for complete speech turn and return transcription.
 
+        Pure data retrieval - no callbacks invoked. Use run_transcription_loop()
+        for continuous transcription with callback handling.
+
+        Returns:
+            Final transcription text, or None if not running/error occurred.
+        """
         if not self._is_running or not self._recorder:
             return None
 
@@ -500,10 +507,6 @@ class STTPipeline:
         try:
             # text() blocks until speech complete
             user_message = await self._loop.run_in_executor(None, self._recorder.text)
-
-            if user_message and self.callbacks.on_final_transcription:
-                self.set_callback(self.callbacks.on_final_transcription, user_message)
-
             return user_message
 
         except Exception as e:
@@ -511,8 +514,14 @@ class STTPipeline:
             return None
 
     async def run_transcription_loop(self) -> None:
-        """Run continuous transcription loop. Continuously listens and transcribes, calling on_final_transcription for each complete utterance. Run this as a background task."""
+        """
+        Run continuous transcription loop.
 
+        Orchestration layer that handles callbacks. Continuously listens and
+        transcribes, invoking on_final_transcription for each complete utterance.
+
+        Run this as a background task via start_transcription_loop().
+        """
         logger.info("Starting transcription loop")
 
         while self._is_running:
@@ -523,6 +532,10 @@ class STTPipeline:
                 user_message = await self.get_transcription()
 
                 if user_message:
+                    # Invoke callback here (orchestration layer handles side effects)
+                    if self.callbacks.on_final_transcription:
+                        self._invoke_callback(self.callbacks.on_final_transcription, user_message)
+
                     logger.debug("Transcription: %s", user_message[:50] + "..." if len(user_message) > 50 else user_message)
 
             except asyncio.CancelledError:
@@ -591,19 +604,13 @@ class WebSocketManager:
 
         self.queues = Queues()
 
-        # Setup STT callbacks
-        stt_callbacks = STTCallbacks(
+        # Initialize STT service with callbacks via constructor injection
+        self.stt_pipeline = STTPipeline(
             on_realtime_update=self.on_realtime_update,
             on_realtime_stabilized=self.on_realtime_stabilized,
             on_final_transcription=self.on_final_transcription,
         )
-
-
-        # Initialize STT service
-        self.stt_pipeline = STTPipeline()
-        self.stt_pipeline.callbacks = stt_callbacks
-        self.stt_pipeline.loop = asyncio.get_event_loop()
-        self.stt_pipeline.initialize()
+        await self.stt_pipeline.start()
 
         # Initialize LLM service with queues and API key
         self.llm_pipeline = LLMPipeline(
@@ -634,7 +641,7 @@ class WebSocketManager:
         """Start all services"""
 
         self.service_tasks = [
-            asyncio.create_task(self.stt_pipeline.transcription_loop()),
+            asyncio.create_task(self.stt_pipeline.run_transcription_loop()),
             asyncio.create_task(self.llm_pipeline.conversation_loop()),
             asyncio.create_task(self.tts_pipeline.speech_loop(send_audio_callback=self.stream_audio_to_client)),
             asyncio.create_task(self.stream_text_to_client())
