@@ -36,7 +36,7 @@ from enum import Enum, auto
 from loguru import logger
 
 from backend.RealtimeSTT import AudioToTextRecorder
-from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
+from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine, StreamingVoiceGenerator
 from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioContent
 from backend.RealtimeTTS.threadsafe_generators import CharIterator, AccumulatingThreadSafeGenerator
@@ -131,6 +131,23 @@ class AudioChunk:
 class Sentence:
     sentence: str
     index: int
+
+@dataclass
+class TTSSentence:
+    """Sentence queued for TTS processing with character/voice info"""
+    text: str
+    sentence_index: int
+    message_id: str
+    character: Character
+    voice: Voice
+    is_final: bool  # Last sentence in this character's response?
+
+@dataclass
+class TTSComplete:
+    """Sentinel indicating TTS generation complete for a message"""
+    message_id: str
+    character_id: str
+    total_sentences: int
 
 ########################################
 ##--             Queues             --##
@@ -629,7 +646,7 @@ class LLMPipeline:
             )
         return self.model_settings
 
-    async def conversation_loop(self, message: str, active_characters: List[Character], user_name: str = "Jay", model_settings: ModelSettings = None,):
+    async def conversation_loop(self, user_name: str = "Jay"):
         """Main LLM conversation loop for multi-character conversations."""
 
         logger.info("Starting main LLM loop")
@@ -642,6 +659,7 @@ class LLMPipeline:
                 if not user_message or not user_message.strip():
                     continue
 
+                self.reset_response_tracking()
                 self.conversation_history.append({"role": "user", "name": user_name, "content": user_message})
 
                 mentioned_characters = self.parse_character_mentions(message=user_message, active_characters=self.active_characters)
@@ -678,35 +696,116 @@ class LLMPipeline:
             except Exception as e:
                 logger.error(f"Error in LLM loop: {e}")
 
+    def get_voice_for_character(self, character: Character) -> Voice:
+        """
+        Get voice configuration for a character.
+        Parses character.voice field or returns default.
+        """
+        if character.voice:
+            try:
+                # Try parsing as JSON
+                voice_data = json.loads(character.voice)
+                return Voice(
+                    voice=voice_data.get("voice", ""),
+                    method=voice_data.get("method", "description"),
+                    speaker_desc=voice_data.get("speaker_desc", ""),
+                    scene_prompt=voice_data.get("scene_prompt", "Audio recorded in a quiet room."),
+                    audio_path=voice_data.get("audio_path", ""),
+                )
+            except (json.JSONDecodeError, TypeError):
+                # Treat as speaker description string
+                return Voice(
+                    voice=character.voice,
+                    method="description",
+                    speaker_desc=character.voice,
+                    scene_prompt="Audio recorded in a quiet room.",
+                )
+
+        # Default voice
+        return Voice(
+            voice="default",
+            method="description",
+            speaker_desc="natural;clear;moderate pitch",
+            scene_prompt="Audio recorded in a quiet room.",
+        )
+
     async def character_response_stream(self, character: Character, text_stream: AsyncIterator) -> str:
-        """Generate and stream a single character's response."""
-
+        """
+        Generate and stream a single character's response.
+        Extracts sentences and queues them for TTS concurrently.
+        """
         message_id = f"msg-{character.id}-{int(time.time() * 1000)}"
+        voice = self.get_voice_for_character(character)
+        sentence_index = 0
 
-        try:
-
+        # Create async generator that yields text deltas and tracks full response
+        async def text_delta_generator() -> AsyncIterator[str]:
             async for chunk in text_stream:
                 if self.interrupt_event.is_set():
                     logger.info(f"Interrupt detected during {character.name}'s response")
                     break
 
-                # Extract content from chunk
                 content = chunk.choices[0].delta.content
                 if content:
                     self.response_text += content
 
                     # Stream to UI immediately
-                    response_chunk = TextChunk(text=content, message_id=message_id, character_name=character.name, 
-                                               chunk_index=self.chunk_index, is_final=False, timestamp=time.time())
-                    
+                    response_chunk = TextChunk(
+                        text=content,
+                        message_id=message_id,
+                        character_name=character.name,
+                        chunk_index=self.chunk_index,
+                        is_final=False,
+                        timestamp=time.time()
+                    )
                     await self.queues.response_queue.put(response_chunk)
                     self.chunk_index += 1
 
+                    yield content
+
+        try:
+            # Extract sentences and queue for TTS
+            async for sentence in generate_sentences_async(
+                text_delta_generator(),
+                quick_yield_single_sentence_fragment=True,
+                quick_yield_for_all_sentences=True,
+                minimum_first_fragment_length=10,
+                minimum_sentence_length=10,
+                cleanup_text_emojis=True,
+            ):
+                text = sentence.strip()
+                if text:
+                    # Strip character tags if present
+                    clean_text = self.strip_character_tags(text)
+                    if clean_text:
+                        tts_sentence = TTSSentence(
+                            text=clean_text,
+                            sentence_index=sentence_index,
+                            message_id=message_id,
+                            character=character,
+                            voice=voice,
+                            is_final=False,
+                        )
+                        await self.queues.sentence_queue.put(tts_sentence)
+                        sentence_index += 1
+
+            # Signal TTS that this message is complete
+            await self.queues.sentence_queue.put(TTSComplete(
+                message_id=message_id,
+                character_id=character.id,
+                total_sentences=sentence_index,
+            ))
+
             # Send final text chunk to UI
-            response_text = TextChunk(text="", message_id=message_id, character_name=character.name, 
-                                      chunk_index=self.chunk_index, is_final=True, timestamp=time.time())
-            
-            await self.queues.response_queue.put(response_text)
+            final_chunk = TextChunk(
+                text="",
+                message_id=message_id,
+                character_name=character.name,
+                chunk_index=self.chunk_index,
+                is_final=True,
+                timestamp=time.time()
+            )
+            await self.queues.response_queue.put(final_chunk)
 
         except Exception as e:
             logger.error(f"Error in character_response_stream for {character.name}: {e}")
@@ -718,10 +817,204 @@ class LLMPipeline:
 ########################################
 
 class TTSPipeline:
-    """Higgs Streaming"""
+    """
+    TTS Pipeline using Higgs Audio with streaming voice consistency.
 
-    async def speech_loop(self):
-        """Main audio generation loop for character speech"""
+    Consumes TTSSentence items from sentence_queue, generates audio tokens,
+    decodes to PCM chunks, and pushes to audio_queue for streaming.
+    """
+
+    def __init__(
+        self,
+        queues: Queues,
+        model_path: str = "bosonai/higgs-audio-v2-generation-3B-base",
+        tokenizer_path: str = "bosonai/higgs-audio-v2-tokenizer",
+        device: str = "cuda",
+        audio_chunk_size: int = 10,  # Small chunks for low latency (~200ms)
+        voice_context_buffer_size: int = 5,
+    ):
+        self.queues = queues
+        self.model_path = model_path
+        self.tokenizer_path = tokenizer_path
+        self.device = device
+        self.audio_chunk_size = audio_chunk_size
+        self.voice_context_buffer_size = voice_context_buffer_size
+
+        self.serve_engine: Optional[HiggsAudioServeEngine] = None
+
+        # Per-character voice generators - persist across entire conversation
+        self.voice_generators: Dict[str, StreamingVoiceGenerator] = {}
+
+        # Track which character is currently speaking for buffering
+        self.current_speaker_id: Optional[str] = None
+        self.is_speaking = False
+
+        # Interrupt handling
+        self.interrupt_event = asyncio.Event()
+
+    async def initialize(self):
+        """Initialize the Higgs Audio serve engine."""
+        logger.info(f"Initializing TTS Pipeline with model: {self.model_path}")
+
+        self.serve_engine = HiggsAudioServeEngine(
+            model_name_or_path=self.model_path,
+            audio_tokenizer_name_or_path=self.tokenizer_path,
+            device=self.device,
+        )
+
+        logger.info("TTS Pipeline initialized successfully")
+
+    def get_or_create_voice_generator(
+        self,
+        character: Character,
+        voice: Voice,
+    ) -> StreamingVoiceGenerator:
+        """
+        Get or create a voice generator for a character.
+        Voice generators persist across the conversation for voice consistency.
+        """
+        if character.id not in self.voice_generators:
+            # Determine voice configuration
+            ref_audio_paths = [voice.audio_path] if voice.audio_path else None
+
+            self.voice_generators[character.id] = StreamingVoiceGenerator(
+                serve_engine=self.serve_engine,
+                scene_prompt=voice.scene_prompt or "Audio is recorded in a quiet room.",
+                speaker_descriptions=voice.speaker_desc or None,
+                ref_audio_paths=ref_audio_paths,
+                generation_chunk_buffer_size=self.voice_context_buffer_size,
+            )
+            logger.info(f"Created voice generator for character: {character.name}")
+
+        return self.voice_generators[character.id]
+
+    def decode_audio_chunk(self, audio_tokens: List[torch.Tensor]) -> bytes:
+        """
+        Decode a chunk of audio tokens to PCM16 bytes.
+
+        Args:
+            audio_tokens: List of audio token tensors
+
+        Returns:
+            PCM16 audio bytes (16kHz, mono)
+        """
+        if not audio_tokens:
+            return b""
+
+        audio_tensor = torch.stack(audio_tokens, dim=1)
+        vq_code = revert_delay_pattern(audio_tensor).clip(
+            0, self.serve_engine.audio_codebook_size - 1
+        )[:, 1:-1]
+
+        waveform = self.serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
+
+        # Convert to PCM16 bytes
+        pcm_bytes = (waveform * 32767).astype(np.int16).tobytes()
+        return pcm_bytes
+
+    async def generate_audio_for_sentence(
+        self,
+        tts_sentence: TTSSentence,
+        send_audio_callback: Callable[[bytes], Awaitable[None]],
+    ):
+        """
+        Generate and stream audio for a single sentence.
+
+        Args:
+            tts_sentence: The sentence to generate audio for
+            send_audio_callback: Async callback to send audio bytes
+        """
+        voice_generator = self.get_or_create_voice_generator(
+            tts_sentence.character,
+            tts_sentence.voice,
+        )
+
+        audio_token_buffer = []
+        chunk_index = 0
+
+        # Generate audio tokens for this sentence
+        async for delta in voice_generator.generate_streaming(
+            text_chunks=[tts_sentence.text],
+            max_new_tokens=2048,
+            temperature=0.7,
+            force_audio_gen=True,
+        ):
+            if self.interrupt_event.is_set():
+                logger.info("TTS interrupted")
+                break
+
+            if delta.audio_tokens is not None:
+                audio_token_buffer.append(delta.audio_tokens.cpu())
+
+                # Decode and send when we have enough tokens
+                if len(audio_token_buffer) >= self.audio_chunk_size:
+                    pcm_bytes = self.decode_audio_chunk(audio_token_buffer[:self.audio_chunk_size])
+
+                    if pcm_bytes:
+                        await send_audio_callback(pcm_bytes)
+
+                    audio_token_buffer = audio_token_buffer[self.audio_chunk_size:]
+                    chunk_index += 1
+
+        # Send remaining tokens
+        if audio_token_buffer and not self.interrupt_event.is_set():
+            pcm_bytes = self.decode_audio_chunk(audio_token_buffer)
+            if pcm_bytes:
+                await send_audio_callback(pcm_bytes)
+
+    async def speech_loop(self, send_audio_callback: Callable[[bytes], Awaitable[None]]):
+        """
+        Main audio generation loop.
+
+        Consumes TTSSentence items from sentence_queue and generates streaming audio.
+        """
+        logger.info("Starting TTS speech loop")
+
+        while True:
+            try:
+                # Get next sentence from queue
+                item = await self.queues.sentence_queue.get()
+
+                if isinstance(item, TTSComplete):
+                    # Message complete, reset speaking state
+                    self.is_speaking = False
+                    self.current_speaker_id = None
+                    logger.debug(f"TTS complete for message: {item.message_id}")
+                    continue
+
+                if not isinstance(item, TTSSentence):
+                    continue
+
+                # Update speaking state
+                self.is_speaking = True
+                self.current_speaker_id = item.character.id
+
+                # Generate audio for this sentence
+                await self.generate_audio_for_sentence(item, send_audio_callback)
+
+                # Clear interrupt if it was set
+                if self.interrupt_event.is_set():
+                    self.interrupt_event.clear()
+
+            except asyncio.CancelledError:
+                logger.info("TTS speech loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in TTS speech loop: {e}")
+                continue
+
+        logger.info("TTS speech loop ended")
+
+    def interrupt(self):
+        """Signal to interrupt current TTS generation."""
+        self.interrupt_event.set()
+        self.is_speaking = False
+
+    async def shutdown(self):
+        """Clean up resources."""
+        self.interrupt()
+        self.voice_generators.clear()
+        logger.info("TTS Pipeline shut down")
 
 ########################################
 ##--        WebSocket Manager       --##
@@ -783,7 +1076,7 @@ class WebSocketManager:
         """Start all services"""
 
         self.service_tasks = [
-            asyncio.create_task(self.stt_pipeline.start_transcription_loop()),
+            self.stt_pipeline.start_transcription_loop(),  # Returns a Task already
             asyncio.create_task(self.llm_pipeline.conversation_loop()),
             asyncio.create_task(self.tts_pipeline.speech_loop(send_audio_callback=self.stream_audio_to_client)),
             asyncio.create_task(self.stream_text_to_client())
@@ -808,11 +1101,12 @@ class WebSocketManager:
 
         # Clear queues
         if self.queues:
-            while not self.queues.sentence_queue.empty():
-                try:
-                    self.queues.sentence_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            for q in [self.queues.sentence_queue, self.queues.audio_queue]:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
         logger.info("WebSocket Manager services shut down")
     
@@ -877,10 +1171,12 @@ class WebSocketManager:
                 logger.info("Conversation history cleared")
 
             elif message_type == "interrupt":
-                # Signal interrupt to stop current generation
+                # Signal interrupt to stop current generation (LLM and TTS)
                 if self.llm_pipeline:
                     self.llm_pipeline.interrupt_event.set()
-                logger.info("Interrupt signal sent")
+                if self.tts_pipeline:
+                    self.tts_pipeline.interrupt()
+                logger.info("Interrupt signal sent to LLM and TTS")
 
             elif message_type == "refresh_active_characters":
                 # Refresh active characters from database
