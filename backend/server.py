@@ -334,25 +334,6 @@ class Chat:
         return self.model_settings
     
 
-    async def text_stream_generator(text_stream: AsyncIterator) -> AsyncIterator[str]:
-
-        async for chunk in text_stream:
-            if chunk.choices:
-                delta = chunk.choices[0].delta
-                if delta and delta.content:
-                    yield delta.content
-
-    async def sentence_generator(text_stream: AsyncIterator, min_first_fragment_length: int = 10, min_sentence_length: int = 20) -> AsyncIterator[str]:
-
-        async for sentence in generate_sentences_async(
-            text_stream,
-            minimum_first_fragment_length=min_first_fragment_length,
-            minimum_sentence_length=min_sentence_length,
-        ):
-            sentence = sentence.strip()
-            if sentence:
-                yield sentence
-
     async def send_conversation_prompt(self, user_name: str = "Jay"):
         """Build message structure and initiate character response for single and multi-character conversations."""
 
@@ -404,31 +385,202 @@ class Chat:
 
 
     async def character_response_stream(self, character: Character, text_stream: AsyncIterator) -> str:
-        """"""
+        """
+        Process LLM stream into sentences for TTS.
+
+        1. Extract text chunks from LLM stream
+        2. Fire UI callback immediately for each chunk
+        3. Feed chunks to stream2sentence for sentence detection
+        4. Put completed sentences in sentence_queue for TTS
+        5. Return full response for conversation history
+        """
 
         message_id = f"msg-{character.id}-{int(time.time() * 1000)}"
+        full_response = ""
+        chunk_index = 0
+        sentence_index = 0
 
-        async def text_stream_generator() -> AsyncIterator[str]:
+        async def chunk_generator() -> AsyncGenerator[str, None]:
+            """Inner generator that extracts content and fires UI callbacks"""
+            nonlocal full_response, chunk_index
+
             async for chunk in text_stream:
-                
-                content = chunk.choices[0].delta.content
-                if content:
-                    self.response_text += content
+                if chunk.choices and chunk.choices[0].delta:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        full_response += content
 
-                    # Stream to UI immediately via callback
-                    if self.on_character_response_chunk:
-                        response_chunk = ResponseChunk(
-                            text=content,
-                            message_id=message_id,
-                            character_name=character.name,
-                            index=self.index,
-                            is_final=False,
-                            timestamp=time.time()
-                        )
-                        await self.on_character_response_chunk(response_chunk)
-                        self.index += 1
-                        
+                        # Fire UI callback immediately (lowest latency for display)
+                        if self.on_character_response_chunk:
+                            response_chunk = ResponseChunk(
+                                text=content,
+                                message_id=message_id,
+                                character_name=character.name,
+                                index=chunk_index,
+                                is_final=False,
+                                timestamp=time.time()
+                            )
+                            await self.on_character_response_chunk(response_chunk)
+
+                        chunk_index += 1
                         yield content
+
+        # Process chunks through stream2sentence
+        async for sentence in generate_sentences_async(
+            chunk_generator(),
+            minimum_first_fragment_length=10,
+            minimum_sentence_length=20,
+        ):
+            sentence_text = sentence.strip()
+            if sentence_text:
+                # Create TTSSentence with voice info and put in queue
+                tts_sentence = TTSSentence(
+                    sentence=sentence_text,
+                    index=sentence_index,
+                    message_id=message_id,
+                    character_name=character.name,
+                    voice=character.voice,
+                    is_final=False
+                )
+                await self.queues.sentence_queue.put(tts_sentence)
+                sentence_index += 1
+
+        # Signal end of sentences for this message
+        final_sentinel = TTSSentence(
+            sentence="",
+            index=sentence_index,
+            message_id=message_id,
+            character_name=character.name,
+            voice=character.voice,
+            is_final=True
+        )
+        await self.queues.sentence_queue.put(final_sentinel)
+
+        # Fire full response callback
+        if self.on_character_response_full:
+            await self.on_character_response_full(full_response, message_id, character.name)
+
+        return full_response
+
+########################################
+##--         TTS Pipeline           --##
+########################################
+
+class TTS:
+    """TTS Pipeline - consumes sentences from queue, generates audio via Higgs"""
+
+    def __init__(self, queues: Queues):
+        self.queues = queues
+        self.serve_engine: Optional[HiggsAudioServeEngine] = None
+        self.is_running = False
+        self._task: Optional[asyncio.Task] = None
+
+        # Callbacks
+        self.on_audio_stream_start: Optional[Callback] = None
+        self.on_audio_chunk: Optional[Callback] = None
+        self.on_audio_stream_stop: Optional[Callback] = None
+
+    async def initialize(self):
+        """Initialize Higgs Audio serve engine"""
+        # TODO: Initialize HiggsAudioServeEngine here
+        # self.serve_engine = HiggsAudioServeEngine(...)
+        pass
+
+    async def start(self):
+        """Start the TTS processing task"""
+        self.is_running = True
+        self._task = asyncio.create_task(self._process_sentences())
+        logger.info("TTS processing task started")
+
+    async def stop(self):
+        """Stop the TTS processing task"""
+        self.is_running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("TTS processing task stopped")
+
+    async def _process_sentences(self):
+        """Main TTS processing loop - consumes from sentence_queue"""
+        current_message_id = None
+
+        while self.is_running:
+            try:
+                # Wait for sentence with timeout to allow checking is_running
+                tts_sentence: TTSSentence = await asyncio.wait_for(
+                    self.queues.sentence_queue.get(),
+                    timeout=0.1
+                )
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+            # Track message transitions for audio stream callbacks
+            if tts_sentence.message_id != current_message_id:
+                # New message starting - fire stop for previous if exists
+                if current_message_id is not None and self.on_audio_stream_stop:
+                    await self.on_audio_stream_stop(current_message_id)
+
+                current_message_id = tts_sentence.message_id
+
+                # Fire start callback for new message
+                if self.on_audio_stream_start:
+                    await self.on_audio_stream_start(
+                        message_id=tts_sentence.message_id,
+                        character_name=tts_sentence.character_name
+                    )
+
+            # Handle end-of-message sentinel
+            if tts_sentence.is_final:
+                if self.on_audio_stream_stop:
+                    await self.on_audio_stream_stop(tts_sentence.message_id)
+                current_message_id = None
+                continue
+
+            # Generate TTS audio for this sentence
+            try:
+                await self.generate_sentence_audio(tts_sentence)
+            except Exception as e:
+                logger.error(f"TTS generation failed for sentence: {e}")
+                # Skip and continue on error
+                continue
+
+    def load_voice_reference(self, voice: str) -> List[Message]:
+        """Load voice reference messages for TTS"""
+        # TODO: Implement voice reference loading
+        # This should return the reference messages for the given voice
+        return []
+
+    async def generate_sentence_audio(self, tts_sentence: TTSSentence):
+        """Generate audio for a sentence using Higgs Audio"""
+
+        messages = self.load_voice_reference(tts_sentence.voice)
+
+        # Add user message with text to generate
+        messages.append(Message(role="user", content=tts_sentence.sentence))
+
+        # Create ChatML sample
+        chat_ml_sample = ChatMLSample(messages=messages)
+
+        async for delta in self.serve_engine.generate_delta_stream(
+            chat_ml_sample=chat_ml_sample,
+            temperature=0.7,
+            top_p=0.95,
+            top_k=50,
+            stop_strings=['<|end_of_text|>', '<|eot_id|>'],
+            ras_win_len=7,
+            ras_win_max_num_repeat=2,
+            force_audio_gen=True,
+        ):
+            # TODO: Process delta and fire on_audio_chunk callback
+            # audio_chunk = AudioChunk(...)
+            # if self.on_audio_chunk:
+            #     await self.on_audio_chunk(audio_chunk)
+            pass
 
 ########################################
 ##--        WebSocket Manager       --##
@@ -438,11 +590,15 @@ class WebSocketManager:
     """Manages WebSocket and orchestrates service modules"""
 
     def __init__(self):
-        """"""
-
+        self.websocket: Optional[WebSocket] = None
+        self.queues: Optional[Queues] = None
+        self.transcribe: Optional[Transcribe] = None
+        self.chat: Optional[Chat] = None
+        self.tts: Optional[TTS] = None
+        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
 
     async def initialize(self):
-        """"""
+        """Initialize all services and start background tasks"""
 
         self.queues = Queues()
 
@@ -459,10 +615,22 @@ class WebSocketManager:
             api_key=self.openrouter_api_key
         )
         await self.chat.initialize()
-        
-        # Wire up UI streaming callbacks
+
+        # Wire up Chat UI streaming callbacks
         self.chat.on_character_response_chunk = self.on_character_response_chunk
         self.chat.on_character_response_full = self.on_character_response_full
+
+        # Initialize TTS service
+        self.tts = TTS(queues=self.queues)
+        await self.tts.initialize()
+
+        # Wire up TTS audio callbacks
+        self.tts.on_audio_stream_start = self.on_audio_stream_start
+        self.tts.on_audio_chunk = self.on_audio_chunk
+        self.tts.on_audio_stream_stop = self.on_audio_stream_stop
+
+        # Start TTS background task
+        await self.tts.start()
 
     async def connect(self, websocket: WebSocket):
         """Accept WebSocket connection"""
@@ -473,6 +641,8 @@ class WebSocketManager:
 
     async def shutdown(self):
         """Shutdown all services gracefully"""
+        if self.tts:
+            await self.tts.stop()
 
 
     async def handle_text_message(self, message: str):
@@ -537,10 +707,12 @@ class WebSocketManager:
 
             elif message_type == "interrupt":
                 # Signal interrupt to stop current generation (LLM and TTS)
+                # TODO: Implement interrupt handling
                 if self.chat:
                     self.chat.interrupt_event.set()
-                if self.tts_pipeline:
-                    self.tts_pipeline.interrupt()
+                if self.tts:
+                    # TODO: Add interrupt method to TTS class
+                    pass
                 logger.info("Interrupt signal sent to LLM and TTS")
 
             elif message_type == "refresh_active_characters":
@@ -585,11 +757,54 @@ class WebSocketManager:
         await self.queues.transcribe_queue.put(user_message)
         await self.send_text_to_client({"type": "stt_final", "text": user_message})
 
-    async def on_character_response_chunk(self, response_chunk: str):
-        await self.send_text_to_client({"type": "response_chunk", "text": response_chunk})
+    async def on_character_response_chunk(self, response_chunk: ResponseChunk):
+        """Send text chunk to client for UI display"""
+        await self.send_text_to_client({
+            "type": "response_chunk",
+            "text": response_chunk.text,
+            "message_id": response_chunk.message_id,
+            "character_name": response_chunk.character_name,
+            "index": response_chunk.index
+        })
 
-    async def on_character_response_full(self, response_full: str):
-        await self.send_text_to_client({"type": "response_full", "text": response_full})
+    async def on_character_response_full(self, response_full: str, message_id: str, character_name: str):
+        """Send full response to client"""
+        await self.send_text_to_client({
+            "type": "response_full",
+            "text": response_full,
+            "message_id": message_id,
+            "character_name": character_name
+        })
+
+    async def on_audio_stream_start(self, message_id: str, character_name: str):
+        """Notify client that audio for a character is starting"""
+        await self.send_text_to_client({
+            "type": "audio_stream_start",
+            "message_id": message_id,
+            "character_name": character_name,
+            "timestamp": time.time()
+        })
+
+    async def on_audio_chunk(self, audio_chunk: AudioChunk):
+        """Send audio chunk to client"""
+        # Send metadata first
+        await self.send_text_to_client({
+            "type": "audio_chunk_meta",
+            "message_id": audio_chunk.message_id,
+            "chunk_id": audio_chunk.chunk_id,
+            "character_name": audio_chunk.character_name,
+            "index": audio_chunk.index,
+        })
+        # Then send binary audio
+        await self.stream_audio_to_client(audio_chunk.audio_data)
+
+    async def on_audio_stream_stop(self, message_id: str):
+        """Notify client that audio stream has ended"""
+        await self.send_text_to_client({
+            "type": "audio_stream_stop",
+            "message_id": message_id,
+            "timestamp": time.time()
+        })
 
     async def disconnect(self):
         """Handle WebSocket disconnection"""
