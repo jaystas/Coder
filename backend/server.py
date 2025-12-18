@@ -14,7 +14,7 @@ import requests
 import threading
 import numpy as np
 import multiprocessing
-from enum import Enum, auto
+import stream2sentence as s2s
 from datetime import datetime
 from pydantic import BaseModel
 from queue import Queue, Empty
@@ -24,7 +24,7 @@ from collections.abc import Awaitable
 from threading import Thread, Event, Lock
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from supabase import Client
+from supabase import create_client, Client
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,14 +32,22 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Quer
 from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable
 from stream2sentence import generate_sentences_async
 from concurrent.futures import ThreadPoolExecutor
+from enum import Enum, auto
+from loguru import logger
 
 from backend.RealtimeSTT import AudioToTextRecorder
+from backend.stream2sentence import generate_sentences_async
 from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
 from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioContent, TextContent
 from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 
 # Database Director - centralized CRUD operations for Supabase
 from backend.database_director import (db, Character, CharacterCreate, CharacterUpdate, Voice, VoiceCreate, VoiceUpdate, Conversation, ConversationCreate, ConversationUpdate, Message as ConversationMessage, MessageCreate)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jslevsbvapopncjehhva.supabase.co")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpzbGV2c2J2YXBvcG5jamVoaHZhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgwNTQwOTMsImV4cCI6MjA3MzYzMDA5M30.DotbJM3IrvdVzwfScxOtsSpxq0xsj7XxI3DvdiqDSrE")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 logging.basicConfig(filename="filelogger.log", format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -159,7 +167,6 @@ class Transcribe:
         except Exception as e:
             logger.error(f"Failed to initialize STT service: {e}")
 
-
     async def transcription_loop(self):
         """Main trascription loop running in separate thread"""
 
@@ -247,10 +254,8 @@ class Chat:
         self.on_character_response_chunk = None
         self.on_character_response_full = None
 
-
     async def initialize(self):
         """"""
-
 
     async def start_new_chat(self):
         """"""
@@ -260,7 +265,48 @@ class Chat:
 
         active_characters = await db.get_active_characters()
 
-    
+
+    def set_active_characters(self, characters: List[Character]):
+        """Set the active characters for the conversation"""
+
+        self.active_characters = characters
+
+    async def load_active_characters_from_db(self):
+        """Load active characters from Supabase database"""
+        try:
+            logger.info("Loading active characters from database...")
+
+            response = supabase.table("characters") \
+                .select("*") \
+                .eq("is_active", True) \
+                .execute()
+
+            if response.data:
+                characters = [
+                    Character(
+                        id=char.get("id", str(uuid.uuid4())),
+                        name=char.get("name", ""),
+                        voice=char.get("voice", ""),
+                        system_prompt=char.get("system_prompt", ""),
+                        image_url=char.get("image_url", ""),
+                        images=char.get("images", []),
+                        is_active=char.get("is_active", True)
+                    )
+                    for char in response.data
+                ]
+
+                self.set_active_characters(characters)
+                logger.info(f"✅ Loaded {len(characters)} active characters: {[c.name for c in characters]}")
+                return characters
+            else:
+                logger.info("No active characters found in database")
+                self.set_active_characters([])
+                return []
+
+        except Exception as e:
+            logger.error(f"Failed to load active characters from database: {e}")
+            return []
+
     def set_model_settings(self, model_settings: ModelSettings):
         """Set model settings for LLM requests"""
 
@@ -270,7 +316,6 @@ class Chat:
         """Clear the conversation history"""
 
         self.conversation_history = []
-
 
     def wrap_with_character_tags(self, text: str, character_name: str) -> str:
         """Wrap response text with character name XML tags for conversation history."""
@@ -383,7 +428,6 @@ class Chat:
             except Exception as e:
                 logger.error(f"Error in LLM loop: {e}")
 
-
     async def character_response_stream(self, character: Character, text_stream: AsyncIterator) -> str:
         """
         Process LLM stream into sentences for TTS.
@@ -480,16 +524,35 @@ class TTS:
         self.on_audio_chunk: Optional[Callback] = None
         self.on_audio_stream_stop: Optional[Callback] = None
 
-    async def initialize(self):
-        """Initialize Higgs Audio serve engine"""
-        # TODO: Initialize HiggsAudioServeEngine here
-        # self.serve_engine = HiggsAudioServeEngine(...)
-        pass
+    def initialize(self):
+        """Initialize Higgs Audio TTS engine"""
+        if self._initialized:
+            return
+
+        logger.info("Initializing Higgs Audio TTS service...")
+
+        try:
+            from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"Using device: {device}")
+
+            self.serve_engine = HiggsAudioServeEngine(
+                model_name_or_path="bosonai/higgs-audio-v2-generation-3B-base",
+                audio_tokenizer_name_or_path="bosonai/higgs-audio-v2-tokenizer",
+                device=device
+            )
+
+            self._initialized = True
+            logger.info("Higgs Audio TTS service initialized successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize Higgs Audio TTS: {e}")
 
     async def start(self):
         """Start the TTS processing task"""
         self.is_running = True
-        self._task = asyncio.create_task(self._process_sentences())
+        self._task = asyncio.create_task(self.process_sentences())
         logger.info("TTS processing task started")
 
     async def stop(self):
@@ -503,17 +566,15 @@ class TTS:
                 pass
         logger.info("TTS processing task stopped")
 
-    async def _process_sentences(self):
+    async def process_sentences(self):
         """Main TTS processing loop - consumes from sentence_queue"""
         current_message_id = None
 
         while self.is_running:
             try:
                 # Wait for sentence with timeout to allow checking is_running
-                tts_sentence: TTSSentence = await asyncio.wait_for(
-                    self.queues.sentence_queue.get(),
-                    timeout=0.1
-                )
+                tts_sentence: TTSSentence = await asyncio.wait_for(self.queues.sentence_queue.get(), timeout=0.1)
+
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -529,10 +590,7 @@ class TTS:
 
                 # Fire start callback for new message
                 if self.on_audio_stream_start:
-                    await self.on_audio_stream_start(
-                        message_id=tts_sentence.message_id,
-                        character_name=tts_sentence.character_name
-                    )
+                    await self.on_audio_stream_start(message_id=tts_sentence.message_id, character_name=tts_sentence.character_name)
 
             # Handle end-of-message sentinel
             if tts_sentence.is_final:
@@ -546,14 +604,25 @@ class TTS:
                 await self.generate_sentence_audio(tts_sentence)
             except Exception as e:
                 logger.error(f"TTS generation failed for sentence: {e}")
-                # Skip and continue on error
                 continue
 
-    def load_voice_reference(self, voice: str) -> List[Message]:
-        """Load voice reference messages for TTS"""
-        # TODO: Implement voice reference loading
-        # This should return the reference messages for the given voice
-        return []
+    def _load_voice_reference(self, voice_name: str):
+        """Load reference audio and text for voice cloning"""
+        from backend.boson_multimodal.data_types import Message, AudioContent
+
+        audio_path = os.path.join(self.voice_dir, f"{voice_name}.wav")
+        text_path = os.path.join(self.voice_dir, f"{voice_name}.txt")
+
+        with open(text_path, 'r', encoding='utf-8') as f:
+            ref_text = f.read().strip()
+
+        # Build messages with reference audio (few-shot approach)
+        messages = [
+            Message(role="user", content=ref_text),
+            Message(role="assistant", content=AudioContent(audio_url=audio_path))
+        ]
+
+        return messages
 
     async def generate_sentence_audio(self, tts_sentence: TTSSentence):
         """Generate audio for a sentence using Higgs Audio"""
@@ -564,23 +633,184 @@ class TTS:
         messages.append(Message(role="user", content=tts_sentence.sentence))
 
         # Create ChatML sample
-        chat_ml_sample = ChatMLSample(messages=messages)
+        chat_sample = ChatMLSample(messages=messages)
 
-        async for delta in self.serve_engine.generate_delta_stream(
-            chat_ml_sample=chat_ml_sample,
-            temperature=0.7,
-            top_p=0.95,
-            top_k=50,
-            stop_strings=['<|end_of_text|>', '<|eot_id|>'],
-            ras_win_len=7,
-            ras_win_max_num_repeat=2,
-            force_audio_gen=True,
-        ):
-            # TODO: Process delta and fire on_audio_chunk callback
-            # audio_chunk = AudioChunk(...)
-            # if self.on_audio_chunk:
-            #     await self.on_audio_chunk(audio_chunk)
-            pass
+        # Stream generation with delta tokens
+        try:
+            output = self.serve_engine.generate_delta_stream(
+                chat_ml_sample=chat_sample,
+                max_new_tokens=1024,
+                temperature=0.7,
+                top_p=0.95,
+                top_k=50,
+                stop_strings=['<|end_of_text|>', '<|eot_id|>'],
+                ras_win_len=7,
+                ras_win_max_num_repeat=2,
+                force_audio_gen=True,
+            )
+
+            # Initialize streaming state
+            audio_tokens: List[torch.Tensor] = []
+            audio_tensor: Optional[torch.Tensor] = None
+            seq_len = 0
+
+            # Crossfade setup
+            cross_fade_samples = int(self._chunk_overlap_duration * self.sample_rate)
+            fade_out = np.linspace(1, 0, cross_fade_samples) if cross_fade_samples > 0 else None
+            fade_in = np.linspace(0, 1, cross_fade_samples) if cross_fade_samples > 0 else None
+            prev_tail: Optional[np.ndarray] = None
+
+            with torch.inference_mode():
+                async for delta in output:
+                    # Skip if no audio tokens
+                    if delta.audio_tokens is None:
+                        continue
+
+                    # Check for end token (1025)
+                    if torch.all(delta.audio_tokens == 1025):
+                        break
+
+                    # Accumulate audio tokens
+                    audio_tokens.append(delta.audio_tokens[:, None])
+                    audio_tensor = torch.cat(audio_tokens, dim=-1)
+
+                    # Count sequence length (skip padding token 1024)
+                    if torch.all(delta.audio_tokens != 1024):
+                        seq_len += 1
+
+                    # Decode and yield when chunk size reached
+                    if seq_len > 0 and seq_len % self._chunk_size == 0:
+                        try:
+                            # Revert delay pattern and decode
+                            vq_code = (
+                                revert_delay_pattern(audio_tensor, start_idx=seq_len - self._chunk_size + 1)
+                                .clip(0, 1023)
+                                .to(self._device)
+                            )
+                            waveform_tensor = self.serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
+
+                            # Convert to numpy
+                            if isinstance(waveform_tensor, torch.Tensor):
+                                waveform_np = waveform_tensor.detach().cpu().numpy()
+                            else:
+                                waveform_np = np.asarray(waveform_tensor, dtype=np.float32)
+
+                            # Apply crossfade
+                            if prev_tail is None:
+                                # First chunk
+                                if cross_fade_samples > 0 and waveform_np.size > cross_fade_samples:
+                                    chunk_head = waveform_np[:-cross_fade_samples]
+                                    prev_tail = waveform_np[-cross_fade_samples:]
+                                else:
+                                    chunk_head = waveform_np
+                                    prev_tail = None
+
+                                if chunk_head.size > 0:
+                                    # Convert to PCM16 and yield
+                                    pcm = np.clip(chunk_head, -1.0, 1.0)
+                                    pcm16 = (pcm * 32767.0).astype(np.int16)
+                                    yield pcm16.tobytes()
+                            else:
+                                # Subsequent chunks with crossfade
+                                if cross_fade_samples > 0 and waveform_np.size >= cross_fade_samples:
+                                    overlap = prev_tail * fade_out + waveform_np[:cross_fade_samples] * fade_in
+                                    middle = (
+                                        waveform_np[cross_fade_samples:-cross_fade_samples]
+                                        if waveform_np.size > 2 * cross_fade_samples
+                                        else np.array([], dtype=waveform_np.dtype)
+                                    )
+                                    to_send = overlap if middle.size == 0 else np.concatenate([overlap, middle])
+
+                                    if to_send.size > 0:
+                                        # Convert to PCM16 and yield
+                                        pcm = np.clip(to_send, -1.0, 1.0)
+                                        pcm16 = (pcm * 32767.0).astype(np.int16)
+                                        yield pcm16.tobytes()
+
+                                    prev_tail = waveform_np[-cross_fade_samples:]
+                                else:
+                                    # Convert to PCM16 and yield
+                                    pcm = np.clip(waveform_np, -1.0, 1.0)
+                                    pcm16 = (pcm * 32767.0).astype(np.int16)
+                                    yield pcm16.tobytes()
+
+                        except Exception as e:
+                            # Skip errors and continue
+                            logger.warning(f"Error decoding audio chunk: {e}")
+                            continue
+
+            # Flush remaining tokens
+            if seq_len > 0 and seq_len % self._chunk_size != 0 and audio_tensor is not None:
+                try:
+                    vq_code = (
+                        revert_delay_pattern(audio_tensor, start_idx=seq_len - seq_len % self._chunk_size + 1)
+                        .clip(0, 1023)
+                        .to(self._device)
+                    )
+                    waveform_tensor = self.serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
+
+                    if isinstance(waveform_tensor, torch.Tensor):
+                        waveform_np = waveform_tensor.detach().cpu().numpy()
+                    else:
+                        waveform_np = np.asarray(waveform_tensor, dtype=np.float32)
+
+                    if prev_tail is None:
+                        pcm = np.clip(waveform_np, -1.0, 1.0)
+                        pcm16 = (pcm * 32767.0).astype(np.int16)
+                        yield pcm16.tobytes()
+                    else:
+                        if cross_fade_samples > 0 and waveform_np.size >= cross_fade_samples:
+                            overlap = prev_tail * fade_out + waveform_np[:cross_fade_samples] * fade_in
+                            rest = waveform_np[cross_fade_samples:]
+                            to_send = overlap if rest.size == 0 else np.concatenate([overlap, rest])
+
+                            pcm = np.clip(to_send, -1.0, 1.0)
+                            pcm16 = (pcm * 32767.0).astype(np.int16)
+                            yield pcm16.tobytes()
+                        else:
+                            pcm = np.clip(waveform_np, -1.0, 1.0)
+                            pcm16 = (pcm * 32767.0).astype(np.int16)
+                            yield pcm16.tobytes()
+                except Exception as e:
+                    logger.warning(f"Error flushing remaining audio: {e}")
+
+            # Yield final tail if exists
+            if prev_tail is not None and prev_tail.size > 0:
+                pcm = np.clip(prev_tail, -1.0, 1.0)
+                pcm16 = (pcm * 32767.0).astype(np.int16)
+                yield pcm16.tobytes()
+
+        except Exception as e:
+            logger.error(f"Error in TTS streaming: {e}")
+            raise
+
+    def get_available_voices(self):
+        """Get list of available voices in format expected by frontend"""
+        if not os.path.exists(self.voice_dir):
+            return []
+
+        voices = []
+        for file in os.listdir(self.voice_dir):
+            if file.endswith('.wav'):
+                voice_name = file[:-4]  # Remove .wav extension
+                # Only include if matching .txt file exists
+                if os.path.exists(os.path.join(self.voice_dir, f"{voice_name}.txt")):
+                    # Format: {id: "voice_name", name: "Voice Name"}
+                    display_name = voice_name.replace('_', ' ').title()
+                    voices.append({
+                        "id": voice_name,
+                        "name": display_name
+                    })
+
+        # Sort by display name
+        voices.sort(key=lambda v: v['name'])
+        return voices
+
+    def shutdown(self):
+        """Cleanup resources"""
+        logger.info('Shutting down TTS manager')
+        self.serve_engine = None
+        self._initialized = False
 
 ########################################
 ##--        WebSocket Manager       --##
@@ -638,12 +868,14 @@ class WebSocketManager:
         self.websocket = websocket
         logger.info("WebSocket connected")
 
+        # Load active characters from database on connection
+        if self.chat:
+            await self.chat.load_active_characters_from_db()
 
     async def shutdown(self):
         """Shutdown all services gracefully"""
         if self.tts:
             await self.tts.stop()
-
 
     async def handle_text_message(self, message: str):
         """Handle incoming text messages from WebSocket client"""
@@ -700,29 +932,23 @@ class WebSocketManager:
                 logger.info(f"Active characters set: {[c.name for c in characters]}")
 
             elif message_type == "clear_history":
-                # Clear conversation history
                 if self.chat:
                     self.chat.clear_conversation_history()
                 logger.info("Conversation history cleared")
 
             elif message_type == "interrupt":
-                # Signal interrupt to stop current generation (LLM and TTS)
-                # TODO: Implement interrupt handling
                 if self.chat:
                     self.chat.interrupt_event.set()
-                if self.tts:
-                    # TODO: Add interrupt method to TTS class
-                    pass
+                if self.chat:
+                    self.chat.interrupt()
                 logger.info("Interrupt signal sent to LLM and TTS")
 
             elif message_type == "refresh_active_characters":
-                # Refresh active characters from database
                 if self.chat:
                     await self.chat.load_active_characters_from_db()
                 logger.info("Active characters refreshed from database")
 
             elif message_type == "ping":
-                # Respond to ping with pong for connection health check
                 await self.send_text_to_client({"type": "pong", "timestamp": time.time()})
 
         except Exception as e:
@@ -871,5 +1097,4 @@ async def websocket_endpoint(websocket: WebSocket):
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
