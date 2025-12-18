@@ -22,12 +22,30 @@ create trigger update_characters_updated_at BEFORE
 update on characters for EACH row
 execute FUNCTION update_updated_at_column ();
 
-create table public.conversations (
-  conversation_id uuid not null default extensions.uuid_generate_v4 (),
-  title text null,
-  active_characters jsonb null default '[]'::jsonb,
+create table public.voices (
+  voice text not null,
+  method text null,
+  audio_path text null,
+  text_path text null,
+  speaker_desc text null,
+  scene_prompt text null,
+  audio_tokens jsonb null,
   created_at timestamp with time zone null default now(),
   updated_at timestamp with time zone null default now(),
+  id text null,
+  constraint voices_pkey primary key (voice)
+) TABLESPACE pg_default;
+
+create trigger update_voices_updated_at BEFORE
+update on voices for EACH row
+execute FUNCTION update_updated_at_column ();
+
+create table public.conversations (
+  conversation_id uuid not null default extensions.uuid_generate_v4 (),
+  created_at timestamp with time zone null default now(),
+  updated_at timestamp with time zone null default now(),
+  title text null,
+  active_characters jsonb[] null,
   constraint conversations_pkey primary key (conversation_id)
 ) TABLESPACE pg_default;
 
@@ -50,41 +68,9 @@ create table public.messages (
 ) TABLESPACE pg_default;
 
 create index IF not exists idx_messages_conversation_id on public.messages using btree (conversation_id) TABLESPACE pg_default;
-
 create index IF not exists idx_messages_character_name on public.messages using btree (name) TABLESPACE pg_default;
-
 create index IF not exists idx_messages_created_at on public.messages using btree (created_at) TABLESPACE pg_default;
 
 create trigger update_messages_updated_at BEFORE
 update on messages for EACH row
-execute FUNCTION update_updated_at_column ();
-
-create table public.voices (
-  voice text not null,
-  method text null,
-  audio_path text null,
-  text_path text null,
-  speaker_desc text null default ''::text,
-  scene_prompt text null default ''::text,
-  audio_tokens jsonb null,
-  created_at timestamp with time zone null default now(),
-  updated_at timestamp with time zone null default now(),
-  constraint voices_pkey primary key (voice)
-) TABLESPACE pg_default;
-
-create trigger update_voices_updated_at BEFORE
-update on voices for EACH row
-execute FUNCTION update_updated_at_column ();
-
-create table public.conversations (
-  conversation_id uuid not null default extensions.uuid_generate_v4 (),
-  created_at timestamp with time zone null default now(),
-  updated_at timestamp with time zone null default now(),
-  title text null,
-  active_characters jsonb[] null,
-  constraint conversations_pkey primary key (conversation_id)
-) TABLESPACE pg_default;
-
-create trigger update_conversations_updated_at BEFORE
-update on conversations for EACH row
 execute FUNCTION update_updated_at_column ();
