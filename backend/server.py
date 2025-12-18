@@ -24,7 +24,7 @@ from collections.abc import Awaitable
 from threading import Thread, Event, Lock
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from supabase import create_client, Client
+from supabase import Client
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,10 +38,21 @@ from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
 from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioContent, TextContent
 from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jslevsbvapopncjehhva.supabase.co")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpzbGV2c2J2YXBvcG5jamVoaHZhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgwNTQwOTMsImV4cCI6MjA3MzYzMDA5M30.DotbJM3IrvdVzwfScxOtsSpxq0xsj7XxI3DvdiqDSrE")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+# Database Director - centralized CRUD operations for Supabase
+from backend.database_director import (
+    db,
+    Character as DBCharacter,
+    CharacterCreate,
+    CharacterUpdate,
+    Voice,
+    VoiceCreate,
+    VoiceUpdate,
+    Conversation as DBConversation,
+    ConversationCreate,
+    ConversationUpdate,
+    Message as DBMessage,
+    MessageCreate,
+)
 
 logging.basicConfig(filename="filelogger.log", format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -55,7 +66,7 @@ class Character(BaseModel):
     id: str
     name: str
     voice: str = ""
-    prompt: str = ""
+    system_prompt: str = ""
     image_url: str = ""
     images: List[str] = []
     last_message: str = ""
@@ -256,7 +267,7 @@ class WebSocketManager:
                 # Set active characters for the conversation
                 characters_data = payload.get("characters", [])
                 characters = [
-                    db.Character(
+                    Character(
                         id=char.get("id", str(uuid.uuid4())),
                         name=char.get("name", ""),
                         voice=char.get("voice", ""),
