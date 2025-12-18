@@ -14,7 +14,6 @@ import requests
 import threading
 import numpy as np
 import multiprocessing
-import stream2sentence as s2s
 from datetime import datetime
 from pydantic import BaseModel
 from queue import Queue, Empty
@@ -30,10 +29,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable
-from stream2sentence import generate_sentences_async
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
-from loguru import logger
 
 from backend.RealtimeSTT import AudioToTextRecorder
 from backend.stream2sentence import generate_sentences_async
@@ -126,16 +123,42 @@ class Queues:
 class Transcribe:
     """Transcription Pipeline"""
 
-    def __init__(self):
+    def __init__(
+        self,
+        on_realtime_update: Optional[Callback] = None,
+        on_realtime_stabilized: Optional[Callback] = None,
+        on_final_transcription: Optional[Callback] = None,
+        on_vad_start: Optional[Callback] = None,
+        on_vad_stop: Optional[Callback] = None,
+        on_recording_start: Optional[Callback] = None,
+        on_recording_stop: Optional[Callback] = None,
+    ):
         self.recorder: Optional[AudioToTextRecorder] = None
         self.recording_thread: Optional[threading.Thread] = None
-        self.callbacks: Dict[str, Any] = {}
         self.is_listening = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
 
-    def initialize(self):
+        # Interrupt detection state
+        self._tts_playing = False
+        self._interrupt_detected = False
+
+        # Store callbacks in dictionary
+        self.callbacks: Dict[str, Optional[Callback]] = {
+            'on_realtime_update': on_realtime_update,
+            'on_realtime_stabilized': on_realtime_stabilized,
+            'on_final_transcription': on_final_transcription,
+            'on_vad_start': on_vad_start,
+            'on_vad_stop': on_vad_stop,
+            'on_recording_start': on_recording_start,
+            'on_recording_stop': on_recording_stop,
+        }
+
+    def initialize(self, loop: Optional[asyncio.AbstractEventLoop] = None):
         """Initialize the STT recorder"""
         logger.info("Initializing STT service...")
+
+        # Store event loop for async callback dispatch
+        self.loop = loop or asyncio.get_event_loop()
 
         try:
             self.recorder = AudioToTextRecorder(
@@ -167,26 +190,47 @@ class Transcribe:
         except Exception as e:
             logger.error(f"Failed to initialize STT service: {e}")
 
-    async def transcription_loop(self):
-        """Main trascription loop running in separate thread"""
+    def transcription_loop(self):
+        """Main transcription loop running in separate thread (synchronous)"""
 
         logger.info("STT transcription loop started")
 
         while True:
             if self.is_listening:
                 try:
-
                     user_message = self.recorder.text()
-                    
-                    if user_message and user_message.strip():
 
-                        if self.callbacks.on_final_transcription:
-                            self.run_callback(self.callbacks.on_final_transcription, user_message)
+                    if user_message and user_message.strip():
+                        callback = self.callbacks.get('on_final_transcription')
+                        if callback:
+                            self.run_callback(callback, user_message)
 
                 except Exception as e:
                     logger.error(f"Error in recording loop: {e}")
 
             time.sleep(0.1)
+
+    def start_listening(self):
+        """Start listening for audio input"""
+        self.is_listening = True
+        logger.info("Started listening for audio")
+
+    def stop_listening(self):
+        """Stop listening for audio input"""
+        self.is_listening = False
+        logger.info("Stopped listening for audio")
+
+    def set_tts_playing(self, playing: bool):
+        """Set TTS playing state for interrupt detection"""
+        self._tts_playing = playing
+
+    def clear_interrupt(self):
+        """Clear interrupt detected flag"""
+        self._interrupt_detected = False
+
+    def was_interrupted(self) -> bool:
+        """Check if interrupt was detected"""
+        return self._interrupt_detected
 
     def feed_audio(self, audio_bytes: bytes):
         """Feed raw PCM audio bytes (16kHz, 16-bit, mono)"""
@@ -210,11 +254,11 @@ class Transcribe:
 
     def _on_realtime_update(self, text: str) -> None:
         """RealtimeSTT callback: real-time transcription update."""
-        self.run_callback(self.callbacks.on_realtime_update, text)
+        self.run_callback(self.callbacks.get('on_realtime_update'), text)
 
     def _on_realtime_stabilized(self, text: str) -> None:
         """RealtimeSTT callback: stabilized transcription."""
-        self.run_callback(self.callbacks.on_realtime_stabilized, text)
+        self.run_callback(self.callbacks.get('on_realtime_stabilized'), text)
 
     def _on_vad_start(self) -> None:
         """RealtimeSTT callback: voice activity started."""
@@ -222,19 +266,19 @@ class Transcribe:
             self._interrupt_detected = True
             logger.info("Interrupt detected: user speaking during TTS")
 
-        self.run_callback(self.callbacks.on_vad_start)
+        self.run_callback(self.callbacks.get('on_vad_start'))
 
     def _on_vad_stop(self) -> None:
         """RealtimeSTT callback: voice activity stopped."""
-        self.run_callback(self.callbacks.on_vad_stop)
+        self.run_callback(self.callbacks.get('on_vad_stop'))
 
     def _on_recording_start(self) -> None:
         """RealtimeSTT callback: recording started."""
-        self.run_callback(self.callbacks.on_recording_start)
+        self.run_callback(self.callbacks.get('on_recording_start'))
 
     def _on_recording_stop(self) -> None:
         """RealtimeSTT callback: recording stopped."""
-        self.run_callback(self.callbacks.on_recording_stop)
+        self.run_callback(self.callbacks.get('on_recording_stop'))
 
 ########################################
 ##--  Chat Pipeline and Management  --##
@@ -249,21 +293,40 @@ class Chat:
         self.conversation_id: Optional[str] = None
         self.queues = queues
         self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
-        
+
+        # Model and character state
+        self.model_settings: Optional[ModelSettings] = None
+        self.active_characters: List[Character] = []
+
+        # Interrupt control
+        self.interrupt_event = asyncio.Event()
+
         # UI streaming callbacks (set by WebSocketManager)
-        self.on_character_response_chunk = None
-        self.on_character_response_full = None
+        self.on_character_response_chunk: Optional[Callback] = None
+        self.on_character_response_full: Optional[Callback] = None
 
     async def initialize(self):
-        """"""
+        """Initialize chat service"""
+        pass
 
     async def start_new_chat(self):
-        """"""
+        """Start a new chat session"""
+        self.conversation_history = []
+        self.conversation_id = str(uuid.uuid4())
+        self.interrupt_event.clear()
 
-    async def get_active_characters(self, active_characters: List[Character]):
-        """Get active characters in conversation"""
+    def interrupt(self):
+        """Signal to interrupt current generation"""
+        self.interrupt_event.set()
+        logger.info("Chat interrupt signal set")
 
-        active_characters = await db.get_active_characters()
+    def clear_interrupt(self):
+        """Clear the interrupt signal"""
+        self.interrupt_event.clear()
+
+    async def get_active_characters(self) -> List[Character]:
+        """Get active characters from database"""
+        return await db.get_active_characters()
 
 
     def set_active_characters(self, characters: List[Character]):
@@ -384,11 +447,13 @@ class Chat:
 
         while True:
             try:
-
                 user_message = await self.queues.transcribe_queue.get()
 
                 if not user_message or not user_message.strip():
                     continue
+
+                # Clear any previous interrupt signal before processing new message
+                self.interrupt_event.clear()
 
                 self.conversation_history.append({"role": "user", "name": user_name, "content": user_message})
 
@@ -519,12 +584,22 @@ class TTS:
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
 
+        # Initialization flag
+        self._initialized = False
+
+        # Audio processing settings
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.voice_dir = "voices"
+        self.sample_rate = 24000  # Higgs Audio sample rate
+        self._chunk_size = 20  # Audio tokens per chunk
+        self._chunk_overlap_duration = 0.05  # Crossfade duration in seconds
+
         # Callbacks
         self.on_audio_stream_start: Optional[Callback] = None
         self.on_audio_chunk: Optional[Callback] = None
         self.on_audio_stream_stop: Optional[Callback] = None
 
-    def initialize(self):
+    async def initialize(self):
         """Initialize Higgs Audio TTS engine"""
         if self._initialized:
             return
@@ -534,13 +609,12 @@ class TTS:
         try:
             from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(f"Using device: {device}")
+            logger.info(f"Using device: {self._device}")
 
             self.serve_engine = HiggsAudioServeEngine(
                 model_name_or_path="bosonai/higgs-audio-v2-generation-3B-base",
                 audio_tokenizer_name_or_path="bosonai/higgs-audio-v2-tokenizer",
-                device=device
+                device=self._device
             )
 
             self._initialized = True
@@ -601,7 +675,21 @@ class TTS:
 
             # Generate TTS audio for this sentence
             try:
-                await self.generate_sentence_audio(tts_sentence)
+                chunk_index = 0
+                async for audio_bytes in self.generate_sentence_audio(tts_sentence):
+                    # Create AudioChunk and fire callback
+                    audio_chunk = AudioChunk(
+                        message_id=tts_sentence.message_id,
+                        chunk_id=f"{tts_sentence.message_id}-{tts_sentence.index}-{chunk_index}",
+                        character_name=tts_sentence.character_name,
+                        audio_data=audio_bytes,
+                        index=chunk_index,
+                        is_final=False,
+                        timestamp=time.time()
+                    )
+                    if self.on_audio_chunk:
+                        await self.on_audio_chunk(audio_chunk)
+                    chunk_index += 1
             except Exception as e:
                 logger.error(f"TTS generation failed for sentence: {e}")
                 continue
@@ -624,10 +712,10 @@ class TTS:
 
         return messages
 
-    async def generate_sentence_audio(self, tts_sentence: TTSSentence):
-        """Generate audio for a sentence using Higgs Audio"""
+    async def generate_sentence_audio(self, tts_sentence: TTSSentence) -> AsyncGenerator[bytes, None]:
+        """Generate audio for a sentence using Higgs Audio (async generator yielding PCM chunks)"""
 
-        messages = self.load_voice_reference(tts_sentence.voice)
+        messages = self._load_voice_reference(tts_sentence.voice)
 
         # Add user message with text to generate
         messages.append(Message(role="user", content=tts_sentence.sentence))
@@ -827,6 +915,9 @@ class WebSocketManager:
         self.tts: Optional[TTS] = None
         self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
 
+        # Background task tracking
+        self._llm_task: Optional[asyncio.Task] = None
+
     async def initialize(self):
         """Initialize all services and start background tasks"""
 
@@ -838,6 +929,8 @@ class WebSocketManager:
             on_realtime_stabilized=self.on_realtime_stabilized,
             on_final_transcription=self.on_final_transcription,
         )
+        # Initialize STT recorder with current event loop
+        self.transcribe.initialize(loop=asyncio.get_running_loop())
 
         # Initialize LLM service with queues and API key
         self.chat = Chat(
@@ -849,6 +942,10 @@ class WebSocketManager:
         # Wire up Chat UI streaming callbacks
         self.chat.on_character_response_chunk = self.on_character_response_chunk
         self.chat.on_character_response_full = self.on_character_response_full
+
+        # Start LLM processing loop as background task
+        self._llm_task = asyncio.create_task(self.chat.send_conversation_prompt())
+        logger.info("LLM processing loop started")
 
         # Initialize TTS service
         self.tts = TTS(queues=self.queues)
@@ -874,6 +971,16 @@ class WebSocketManager:
 
     async def shutdown(self):
         """Shutdown all services gracefully"""
+        # Cancel LLM processing task
+        if self._llm_task:
+            self._llm_task.cancel()
+            try:
+                await self._llm_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("LLM processing loop stopped")
+
+        # Stop TTS service
         if self.tts:
             await self.tts.stop()
 
@@ -937,8 +1044,6 @@ class WebSocketManager:
                 logger.info("Conversation history cleared")
 
             elif message_type == "interrupt":
-                if self.chat:
-                    self.chat.interrupt_event.set()
                 if self.chat:
                     self.chat.interrupt()
                 logger.info("Interrupt signal sent to LLM and TTS")
