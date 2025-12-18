@@ -194,24 +194,17 @@ class WebSocketManager:
             on_realtime_stabilized=self.on_realtime_stabilized,
             on_final_transcription=self.on_final_transcription,
         )
-        await self.stt_pipeline.start()
 
         # Initialize LLM service with queues and API key
         self.conversation = Conversation(
             queues=self.queues,
             api_key=self.openrouter_api_key
         )
-        await self.llm_pipeline.initialize()
+        await self.conversation.initialize()
         
         # Wire up UI streaming callbacks
-        self.llm_pipeline.on_character_response_chunk = self.on_character_response_chunk
-        self.llm_pipeline.on_character_response_text = self.on_character_response_text
-
-        # Initialize TTS Service Manager with queues
-        self.tts_pipeline = TTSPipeline(queues=self.queues)
-        await self.tts_pipeline.initialize()
-
-        logger.info("WebSocketManager initialized")
+        self.conversation.on_character_response_chunk = self.on_character_response_chunk
+        self.conversation.on_character_response_ful = self.on_character_response_full
 
     async def connect(self, websocket: WebSocket):
         """Accept WebSocket connection"""
@@ -219,24 +212,9 @@ class WebSocketManager:
         self.websocket = websocket
         logger.info("WebSocket connected")
 
-        # Load active characters from database on connection
-        if self.llm_pipeline:
-            await self.llm_pipeline.load_active_characters_from_db()
-
-        await self.start_service_tasks()
-
-    async def start_service_tasks(self):
-        """Start all services"""
-
-        self.service_tasks = [
-            asyncio.create_task(self.conversation.conversation_loop()),
-            asyncio.create_task(self.tts_pipeline.speech_loop(send_audio_callback=self.stream_audio_to_client)),
-            asyncio.create_task(self.stream_text_to_client())
-        ]
 
     async def shutdown(self):
         """Shutdown all services gracefully"""
-
 
 
     async def handle_text_message(self, message: str):
@@ -420,4 +398,5 @@ async def websocket_endpoint(websocket: WebSocket):
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
