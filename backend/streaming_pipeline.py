@@ -145,6 +145,19 @@ class LLMStreamProcessor:
 # Higgs TTS Worker
 # ============================================================================
 
+def revert_delay_pattern(data: torch.Tensor, start_idx: int = 0) -> torch.Tensor:
+    """Undo Higgs delay pattern so decoded frames line up."""
+    if data.ndim != 2:
+        raise ValueError('Expected 2D tensor from audio tokenizer')
+    if data.shape[1] - data.shape[0] < start_idx:
+        raise ValueError('Invalid start_idx for delay pattern reversion')
+
+    out = []
+    num_codebooks = data.shape[0]
+    for i in range(num_codebooks):
+        out.append(data[i:(i + 1), i + start_idx:(data.shape[1] - num_codebooks + 1 + i)])
+    return torch.cat(out, dim=0)
+
 class HiggsTTSWorker:
     """TTS worker that synthesizes sentences using Higgs Audio"""
 
