@@ -363,11 +363,14 @@ class AudioStreamer:
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
         self.websocket: Optional[WebSocket] = None
+        # Event to signal when streaming is complete (is_final processed)
+        self.stream_complete: asyncio.Event = asyncio.Event()
 
     async def start(self, websocket: WebSocket):
         """Start streaming to a WebSocket"""
         self.websocket = websocket
         self.is_running = True
+        self.stream_complete.clear()  # Reset for new session
         self._task = asyncio.create_task(self._stream_loop())
         logger.info("Audio streamer started")
 
@@ -381,6 +384,13 @@ class AudioStreamer:
             except asyncio.CancelledError:
                 pass
         logger.info("Audio streamer stopped")
+
+    async def wait_for_complete(self, timeout: float = 60.0):
+        """Wait for the stream to complete (is_final received and sent)"""
+        try:
+            await asyncio.wait_for(self.stream_complete.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("[Stream] Timeout waiting for stream complete")
 
     async def _stream_loop(self):
         """Main streaming loop"""
@@ -402,6 +412,8 @@ class AudioStreamer:
                     "session_id": chunk.session_id
                 })
                 logger.info(f"[Stream] Audio complete sent")
+                # Signal that streaming is complete
+                self.stream_complete.set()
                 continue
 
             # Send audio data as binary
@@ -465,12 +477,9 @@ class StreamingPipeline:
                 on_text_chunk=on_text_chunk
             )
 
-            # Wait for audio queue to drain (give TTS time to finish)
-            while not self.queues.audio_queue.empty():
-                await asyncio.sleep(0.05)
-
-            # Small grace period for final chunks
-            await asyncio.sleep(0.2)
+            # Wait for audio streaming to complete (is_final processed)
+            # This ensures all audio is sent before we return
+            await self.audio_streamer.wait_for_complete(timeout=60.0)
 
             return full_response
 
