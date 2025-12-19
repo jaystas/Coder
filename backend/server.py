@@ -442,12 +442,13 @@ class Chat:
         return self.model_settings
     
 
-    async def send_conversation_prompt(self, user_name: str = "Jay"):
+    async def send_conversation_prompt(self, messages: str, character: Character, user_name: str = "Jay",
+                                         model_settings: ModelSettings = None, user_message=str):
         """Build message structure and initiate character response for single and multi-character conversations."""
 
         while True:
             try:
-                user_message = await self.queues.transcribe_queue.get()
+                user_message = await self.queues.transcribe_queue.get(user_message)
 
                 if not user_message or not user_message.strip():
                     continue
@@ -505,19 +506,19 @@ class Chat:
         """
 
         message_id = f"msg-{character.id}-{int(time.time() * 1000)}"
-        full_response = ""
+        response_full = ""
         chunk_index = 0
         sentence_index = 0
 
         async def chunk_generator() -> AsyncGenerator[str, None]:
             """Inner generator that extracts content and fires UI callbacks"""
-            nonlocal full_response, chunk_index
+            nonlocal response_full, chunk_index
 
             async for chunk in text_stream:
                 if chunk.choices and chunk.choices[0].delta:
                     content = chunk.choices[0].delta.content
                     if content:
-                        full_response += content
+                        response_full += content
 
                         # Fire UI callback immediately (lowest latency for display)
                         if self.on_character_response_chunk:
@@ -567,9 +568,9 @@ class Chat:
 
         # Fire full response callback
         if self.on_character_response_full:
-            await self.on_character_response_full(full_response, message_id, character.name)
+            await self.on_character_response_full(response_full, message_id, character.name)
 
-        return full_response
+        return response_full
 
 ########################################
 ##--         TTS Pipeline           --##
@@ -913,7 +914,7 @@ class WebSocketManager:
         self.transcribe: Optional[Transcribe] = None
         self.chat: Optional[Chat] = None
         self.tts: Optional[TTS] = None
-        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
+        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "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")
 
         # Background task tracking
         self._llm_task: Optional[asyncio.Task] = None
@@ -944,7 +945,7 @@ class WebSocketManager:
         self.chat.on_character_response_full = self.on_character_response_full
 
         # Start LLM processing loop as background task
-        self._llm_task = asyncio.create_task(self.chat.send_conversation_prompt())
+        self._llm_task = asyncio.create_task(self.chat.send_conversation_prompt(messages=str, character=Character))
         logger.info("LLM processing loop started")
 
         # Initialize TTS service
