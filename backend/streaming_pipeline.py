@@ -172,6 +172,10 @@ class HiggsTTSWorker:
         self._chunk_size = 20  # Audio tokens per chunk before decoding
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        # Crossfade settings (equal-power for smooth transitions)
+        self._crossfade_duration = 0.04  # 40ms crossfade
+        self._crossfade_samples = int(self._crossfade_duration * self.sample_rate)
+
         # Voice reference
         self.voice_dir = "backend/voices"
         self.voice_name = "amelia"
@@ -263,8 +267,70 @@ class HiggsTTSWorker:
             Message(role="assistant", content=AudioContent(audio_url=audio_path))
         ]
 
+    def _create_crossfade_curves(self) -> tuple[np.ndarray, np.ndarray]:
+        """Create equal-power crossfade curves (sine/cosine) for smooth transitions"""
+        t = np.linspace(0, 1, self._crossfade_samples, dtype=np.float32)
+        # Equal-power: sin²(x) + cos²(x) = 1, maintains constant loudness
+        fade_in = np.sin(t * np.pi / 2)
+        fade_out = np.cos(t * np.pi / 2)
+        return fade_in, fade_out
+
+    def _apply_crossfade(
+        self,
+        waveform: np.ndarray,
+        prev_tail: Optional[np.ndarray],
+        fade_in: np.ndarray,
+        fade_out: np.ndarray,
+        is_final: bool = False
+    ) -> tuple[bytes, Optional[np.ndarray]]:
+        """
+        Apply equal-power crossfade between chunks.
+        Returns (pcm_bytes_to_send, new_tail_to_keep).
+        """
+        cf_samples = self._crossfade_samples
+
+        if prev_tail is None:
+            # First chunk: send everything except tail (save for next crossfade)
+            if cf_samples > 0 and waveform.size > cf_samples and not is_final:
+                to_send = waveform[:-cf_samples]
+                new_tail = waveform[-cf_samples:]
+            else:
+                to_send = waveform
+                new_tail = None
+        else:
+            # Subsequent chunks: crossfade with previous tail
+            if cf_samples > 0 and waveform.size >= cf_samples:
+                # Equal-power crossfade: overlap = prev * cos + curr * sin
+                overlap = prev_tail * fade_out + waveform[:cf_samples] * fade_in
+
+                if is_final:
+                    # Final chunk: send overlap + rest, no new tail
+                    rest = waveform[cf_samples:]
+                    to_send = np.concatenate([overlap, rest]) if rest.size > 0 else overlap
+                    new_tail = None
+                elif waveform.size > 2 * cf_samples:
+                    # Normal chunk: send overlap + middle, keep new tail
+                    middle = waveform[cf_samples:-cf_samples]
+                    to_send = np.concatenate([overlap, middle])
+                    new_tail = waveform[-cf_samples:]
+                else:
+                    # Short chunk: just send overlap
+                    to_send = overlap
+                    new_tail = waveform[-cf_samples:] if waveform.size > cf_samples else None
+            else:
+                # Chunk too small for crossfade
+                to_send = waveform
+                new_tail = None
+
+        # Convert to PCM16 bytes
+        if to_send.size > 0:
+            pcm = np.clip(to_send, -1.0, 1.0)
+            pcm16 = (pcm * 32767.0).astype(np.int16)
+            return pcm16.tobytes(), new_tail
+        return b"", new_tail
+
     async def _generate_audio(self, text: str) -> AsyncGenerator[bytes, None]:
-        """Generate audio for text using Higgs streaming"""
+        """Generate audio for text using Higgs streaming with equal-power crossfade"""
 
         # Build messages with amelia voice reference
         messages = self._load_voice_messages()
@@ -275,6 +341,10 @@ class HiggsTTSWorker:
         # Initialize streaming state
         audio_tokens: list[torch.Tensor] = []
         seq_len = 0
+
+        # Crossfade state
+        fade_in, fade_out = self._create_crossfade_curves()
+        prev_tail: Optional[np.ndarray] = None
 
         with torch.inference_mode():
             async for delta in self.engine.generate_delta_stream(
@@ -323,10 +393,12 @@ class HiggsTTSWorker:
                         else:
                             waveform_np = np.asarray(waveform, dtype=np.float32)
 
-                        # Convert to PCM16 bytes
-                        pcm = np.clip(waveform_np, -1.0, 1.0)
-                        pcm16 = (pcm * 32767.0).astype(np.int16)
-                        yield pcm16.tobytes()
+                        # Apply crossfade and yield
+                        pcm_bytes, prev_tail = self._apply_crossfade(
+                            waveform_np, prev_tail, fade_in, fade_out
+                        )
+                        if pcm_bytes:
+                            yield pcm_bytes
 
                     except Exception as e:
                         logger.warning(f"Error decoding chunk: {e}")
@@ -356,12 +428,21 @@ class HiggsTTSWorker:
                 else:
                     waveform_np = np.asarray(waveform, dtype=np.float32)
 
-                pcm = np.clip(waveform_np, -1.0, 1.0)
-                pcm16 = (pcm * 32767.0).astype(np.int16)
-                yield pcm16.tobytes()
+                # Final chunk crossfade
+                pcm_bytes, prev_tail = self._apply_crossfade(
+                    waveform_np, prev_tail, fade_in, fade_out, is_final=True
+                )
+                if pcm_bytes:
+                    yield pcm_bytes
 
             except Exception as e:
                 logger.warning(f"Error flushing remaining audio: {e}")
+
+        # Yield any remaining tail
+        if prev_tail is not None and prev_tail.size > 0:
+            pcm = np.clip(prev_tail, -1.0, 1.0)
+            pcm16 = (pcm * 32767.0).astype(np.int16)
+            yield pcm16.tobytes()
 
 
 # ============================================================================
