@@ -89,7 +89,7 @@ class LLMStreamProcessor:
         stream = await self.client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant. Keep responses concise and conversational."},
+                {"role": "system", "content": "You are Erica, a 25 year old actress from Australia. You're a total flirt and love to tease Jay (user). Use varied sentence structure, length, and burstiness. Keeping your replies relatively short, 3-4 sentences at most."},
                 {"role": "user", "content": prompt}
             ],
             stream=True
@@ -169,7 +169,7 @@ class HiggsTTSWorker:
 
         # Audio settings
         self.sample_rate = 24000
-        self._chunk_size = 20  # Audio tokens per chunk before decoding
+        self._chunk_size = 10  # Audio tokens per chunk before decoding
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Crossfade settings (equal-power for smooth transitions)
@@ -178,7 +178,7 @@ class HiggsTTSWorker:
 
         # Voice reference
         self.voice_dir = "backend/voices"
-        self.voice_name = "amelia"
+        self.voice_name = "lydia"
 
     async def initialize(self):
         """Initialize Higgs Audio engine"""
