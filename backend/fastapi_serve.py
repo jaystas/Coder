@@ -1,45 +1,41 @@
+# Standard library
 import os
 import re
-import sys
 import json
-import time
 import uuid
-import queue
-import torch
-import uvicorn
 import asyncio
-import aiohttp
 import logging
-import requests
 import threading
-import numpy as np
-import multiprocessing
-from datetime import datetime
-from pydantic import BaseModel
-from queue import Queue, Empty
-from openai import AsyncOpenAI
-from collections import defaultdict
-from collections.abc import Awaitable
-from threading import Thread, Event, Lock
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
+from typing import Callable, Optional, Dict, List, AsyncGenerator, Awaitable
+
+# Third-party
+import uvicorn
 from supabase import create_client, Client
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
-from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable
-from concurrent.futures import ThreadPoolExecutor
-from enum import Enum, auto
 
+# Local imports
 from backend.RealtimeSTT import AudioToTextRecorder
 from backend.stream2sentence import generate_sentences_async
-from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
-from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioContent, TextContent
-from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 
 # Database Director - centralized CRUD operations for Supabase
-from backend.database_director import (db, Character, CharacterCreate, CharacterUpdate, Voice, VoiceCreate, VoiceUpdate, Conversation, ConversationCreate, ConversationUpdate, Message as ConversationMessage, MessageCreate)
+from backend.database_director import (
+    db,
+    Character,
+    CharacterCreate,
+    CharacterUpdate,
+    Voice,
+    VoiceCreate,
+    VoiceUpdate,
+    Conversation,
+    ConversationCreate,
+    ConversationUpdate,
+    Message as ConversationMessage,
+    MessageCreate,
+)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jslevsbvapopncjehhva.supabase.co")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpzbGV2c2J2YXBvcG5jamVoaHZhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgwNTQwOTMsImV4cCI6MjA3MzYzMDA5M30.DotbJM3IrvdVzwfScxOtsSpxq0xsj7XxI3DvdiqDSrE")
@@ -87,7 +83,11 @@ class StreamingQueues:
     """Manages asyncio queues for the pipeline"""
 
     def __init__(self):
+        # Queue for transcribed user messages (STT → Chat)
+        self.transcribe_queue: asyncio.Queue[str] = asyncio.Queue()
+        # Queue for sentences to be synthesized (Chat → TTS)
         self.sentence_queue: asyncio.Queue[TTSSentence] = asyncio.Queue()
+        # Queue for audio chunks to stream (TTS → WebSocket)
         self.audio_queue: asyncio.Queue[AudioChunk] = asyncio.Queue()
 
 ########################################
@@ -110,11 +110,17 @@ class Transcribe:
         on_recording_start: Optional[Callback] = None,
         on_recording_stop: Optional[Callback] = None,
     ):
+        # Event loop for async callback dispatching (set by WebSocketManager)
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # Transcription thread
+        self._thread: Optional[threading.Thread] = None
+
+        # Callback registry - keys match the internal callback method names
         self.callbacks: Dict[str, Optional[Callback]] = {
-            'on_realtime_update': on_transcription_update,
-            'on_realtime_stabilized': on_transcription_stabilized,
-            'on_final_transcription': on_transcription_finished,
+            'on_transcription_update': on_transcription_update,
+            'on_transcription_stabilized': on_transcription_stabilized,
+            'on_transcription_finished': on_transcription_finished,
             'on_vad_detect_start': on_vad_detect_start,
             'on_vad_detect_stop': on_vad_detect_stop,
             'on_vad_start': on_vad_start,
@@ -153,12 +159,12 @@ class Transcribe:
 
         while self.is_listening:
             try:
-
                 user_message = self.recorder.text()
 
                 if user_message and user_message.strip():
-                    if self.callbacks.on_transcription_finished:
-                        self.run_callback(self.callbacks.on_transcription_finished, user_message)
+                    callback = self.callbacks.get('on_transcription_finished')
+                    if callback:
+                        self.run_callback(callback, user_message)
 
             except Exception as e:
                 logger.error(f"Error in recording loop: {e}")
@@ -186,17 +192,30 @@ class Transcribe:
 
     def start_listening(self):
         """Start listening for audio input"""
+        if self.is_listening:
+            return  # Already listening
+
         self.is_listening = True
+
+        # Start transcription in background thread
+        self._thread = threading.Thread(target=self.transcriber, daemon=True)
+        self._thread.start()
         logger.info("Started listening for audio")
 
     def stop_listening(self):
         """Stop listening for audio input"""
         self.is_listening = False
+
+        # Wait for thread to finish
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
         logger.info("Stopped listening for audio")
 
     def _on_transcription_update(self, text: str) -> None:
         """RealtimeSTT callback: real-time transcription update."""
-        self.run_callback(self.callback.get('on_transcription_update'), text)
+        self.run_callback(self.callbacks.get('on_transcription_update'), text)
 
     def _on_transcription_stabilized(self, text: str) -> None:
         """RealtimeSTT callback: stabilized transcription."""
@@ -236,7 +255,13 @@ class Transcribe:
 ########################################
 
 class ChatFunctions:
-    """"""
+    """Manages LLM chat sessions and conversation history"""
+
+    def __init__(self):
+        self.conversation_history: List[Dict[str, str]] = []
+        self.conversation_id: Optional[str] = None
+        self.model_settings: Optional[ModelSettings] = None
+        self.active_characters: List[Character] = []
 
     async def start_new_chat(self):
         """Start a new chat session"""
@@ -322,15 +347,15 @@ class ChatFunctions:
         mentioned_characters = self.parse_character_mentions(message=user_message, active_characters=self.active_characters)
 
 
-    async def send_message_to_character():
-        """User Message with added Structure"""
+    async def send_message_to_character(self, user_message: str, character: Character):
+        """Send user message to a character and get streaming response"""
+        # TODO: Integrate with streaming pipeline
+        pass
 
-
-
-    async def character_response_stream():
+    async def character_response_stream(self, messages: List[Dict[str, str]], character: Character) -> AsyncGenerator[str, None]:
         """Character response text stream from OpenRouter API"""
-
-        # integration point with streaming pipeline.
+        # TODO: Integration point with streaming pipeline
+        yield ""
 
 
 
@@ -343,10 +368,13 @@ class ConversationPipeline:
     """Orchestrates Complete LLM → TTS → Audio Pipeline"""
 
     def __init__(self):
-        """"""
+        self.chat = ChatFunctions()
+        self.queues = StreamingQueues()
 
-    async def conversate():
-        """"""
+    async def conversate(self, user_message: str, character: Character, websocket: WebSocket):
+        """Main conversation flow: user message → LLM → TTS → audio stream"""
+        # TODO: Integrate with streaming pipeline
+        pass
 
 
 
@@ -356,15 +384,53 @@ class ConversationPipeline:
 ########################################
 
 class WebSocketManager:
-    """Manages WebSocket and Routes Messages"""
+    """Manages WebSocket connections and routes messages"""
 
     def __init__(self):
+        # WebSocket connection
+        self.websocket: Optional[WebSocket] = None
 
+        # Event loop reference for async callback dispatching
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Shared queues for pipeline
+        self.queues = StreamingQueues()
+
+        # Chat functions for LLM interaction
+        self.chat = ChatFunctions()
+
+        # Transcription handler with callbacks
         self.transcribe = Transcribe(
-            on_realtime_update=self.on_transcription_update,
-            on_realtime_stabilized=self.on_transcription_stabilized,
-            on_final_transcription=self.on_transcription_finished,
+            on_transcription_update=self.on_transcription_update,
+            on_transcription_stabilized=self.on_transcription_stabilized,
+            on_transcription_finished=self.on_transcription_finished,
         )
+
+    async def initialize(self):
+        """Initialize resources on app startup"""
+        self.loop = asyncio.get_running_loop()
+        # Pass event loop to transcribe for async callback dispatching
+        self.transcribe.loop = self.loop
+        logger.info("WebSocketManager initialized")
+
+    async def shutdown(self):
+        """Clean up resources on app shutdown"""
+        if self.transcribe:
+            self.transcribe.stop_listening()
+        logger.info("WebSocketManager shut down")
+
+    async def connect(self, websocket: WebSocket):
+        """Accept new WebSocket connection"""
+        await websocket.accept()
+        self.websocket = websocket
+        logger.info("WebSocket client connected")
+
+    async def disconnect(self):
+        """Clean up on WebSocket disconnect"""
+        if self.transcribe:
+            self.transcribe.stop_listening()
+        self.websocket = None
+        logger.info("WebSocket client disconnected")
 
     async def handle_text_message(self, message: str):
         """Handle incoming text messages from WebSocket client"""
@@ -401,6 +467,8 @@ class WebSocketManager:
                     self.chat.set_model_settings(model_settings)
                 logger.info(f"Model settings updated: {model_settings.model}")
 
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON message: {e}")
         except Exception as e:
             logger.error(f"Error handling message: {e}", exc_info=True)
 
@@ -416,20 +484,29 @@ class WebSocketManager:
     async def send_text_to_client(self, data: dict):
         """Send JSON message to client"""
         if self.websocket:
-            await self.websocket.send_text(json.dumps(data))
-    
+            try:
+                await self.websocket.send_text(json.dumps(data))
+            except Exception as e:
+                logger.error(f"Failed to send text to client: {e}")
+
     async def stream_audio_to_client(self, audio_bytes: bytes):
         """Send binary audio to client (TTS)"""
         if self.websocket:
-            await self.websocket.send_bytes(audio_bytes)
+            try:
+                await self.websocket.send_bytes(audio_bytes)
+            except Exception as e:
+                logger.error(f"Failed to send audio to client: {e}")
 
     async def on_transcription_update(self, text: str):
+        """Callback: realtime transcription update"""
         await self.send_text_to_client({"type": "stt_update", "text": text})
-    
+
     async def on_transcription_stabilized(self, text: str):
+        """Callback: stabilized transcription"""
         await self.send_text_to_client({"type": "stt_stabilized", "text": text})
-    
+
     async def on_transcription_finished(self, user_message: str):
+        """Callback: final transcription complete"""
         await self.queues.transcribe_queue.put(user_message)
         await self.send_text_to_client({"type": "stt_finished", "text": user_message})
 
