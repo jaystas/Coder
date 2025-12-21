@@ -4,7 +4,7 @@
     "messages": [
       {
         "role": "system",
-        "content": "This is the main system prompt. It is sent once at the beginning of the conversation. Included in conversation history, stays up top."
+        "content": "Each character gets their own main system prompt. It is sent once at the beginning of the conversation and stays up top."
       },
       {
         "role": "user",
@@ -28,7 +28,7 @@
       },
       {
         "role": "system",
-        "content": "We also append what we call the 'character instruction message' to the end of the conversation history. This is sent with every request --> 'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}'s reply. Do not respond for/as anyone else. Wrap your entire response in <{character.name}></{character.name}> tags.'"
+        "content": "We also append what we call the 'character instruction message' to the end of the conversation history. This is sent with every request --> 'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}'s reply. Do not respond for/as anyone else.'"
       }
     ]
   }
