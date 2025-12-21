@@ -391,7 +391,6 @@ function loadPage(page, container) {
           <!-- Tabs Header -->
           <div class="tabs-header">
             <button class="character-tab-button active" data-tab="profile">Profile</button>
-            <button class="character-tab-button" data-tab="voice">Voice</button>
             <button class="character-tab-button" data-tab="background">Background</button>
             <button class="character-tab-button" data-tab="chats">Chats</button>
             <button class="character-tab-button" data-tab="groups">Groups</button>
@@ -439,47 +438,6 @@ function loadPage(page, container) {
                   <div class="form-group">
                     <label class="form-label">System Prompt</label>
                     <textarea class="form-textarea" id="character-system-prompt" placeholder="Enter system prompt"></textarea>
-                  </div>
-                </div>
-
-                <!-- Voice Tab -->
-                <div class="tab-panel" id="voice-panel">
-                  <div class="form-group">
-                    <label class="form-label">Method</label>
-                    <div class="radio-group">
-                      <label class="radio-label">
-                        <input type="radio" name="voice-method" value="clone" class="radio-input" id="voice-method-clone" checked>
-                        <span class="radio-text">Clone</span>
-                      </label>
-                      <label class="radio-label">
-                        <input type="radio" name="voice-method" value="profile" class="radio-input" id="voice-method-profile">
-                        <span class="radio-text">Profile</span>
-                      </label>
-                    </div>
-                  </div>
-
-                  <div class="form-group">
-                    <label class="form-label">Speaker Description</label>
-                    <textarea class="form-textarea" id="voice-speaker-description" placeholder="Describe the speaker's voice characteristics, tone, accent, and style..."></textarea>
-                  </div>
-
-                  <div class="form-group">
-                    <label class="form-label">Scene Prompt</label>
-                    <textarea class="form-textarea" id="voice-scene-prompt" placeholder="Describe the scene or context for the voice generation..."></textarea>
-                  </div>
-
-                  <div class="form-group">
-                    <label class="form-label">Audio Path</label>
-                    <input type="text" class="form-input single-line" id="voice-audio-path" placeholder="Enter audio file URL">
-                  </div>
-
-                  <div class="form-group">
-                    <label class="form-label">Text Path</label>
-                    <input type="text" class="form-input single-line" id="voice-text-path" placeholder="Enter text file URL">
-                  </div>
-
-                  <div class="form-group">
-                    <button class="btn btn-primary" id="create-voice-btn">Create Voice</button>
                   </div>
                 </div>
 
@@ -553,9 +511,83 @@ function loadPage(page, container) {
     `,
 
     speech: `
-      <div class="page-content" style="display: block;">
-        <h1>Speech</h1>
-        <p>Configure text-to-speech and speech-to-text settings.</p>
+      <div class="speech-page">
+        <!-- Left Column: Content -->
+        <div class="speech-content-column">
+             <div class="speech-list-placeholder">
+                <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>
+                <h3>Voice List</h3>
+                <p>Coming soon: Manage your cached and generated voices here.</p>
+             </div>
+        </div>
+
+        <!-- Right Column: Voice Creator -->
+        <div class="speech-creator-column">
+          <div class="voice-generator-card">
+            <div class="voice-generator-header">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+              </svg>
+              <h2>Create Voice</h2>
+            </div>
+            
+            <div class="voice-generator-body">
+                <div class="speech-form-group">
+                    <label class="speech-form-label">Voice Name</label>
+                    <input type="text" class="speech-form-input" id="speech-voice-name" placeholder="E.g., Mysterious Wizard">
+                </div>
+
+                <div class="speech-form-group">
+                    <label class="speech-form-label">Method</label>
+                    <div class="method-selector">
+                        <label class="method-card">
+                            <input type="radio" name="speech-method" value="clone" id="speech-method-clone" checked>
+                            <div class="method-content">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                                </svg>
+                                <span>Clone</span>
+                            </div>
+                        </label>
+                        <label class="method-card">
+                            <input type="radio" name="speech-method" value="profile" id="speech-method-profile">
+                            <div class="method-content">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                                </svg>
+                                <span>Profile</span>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="speech-form-group">
+                    <label class="speech-form-label">Speaker Description</label>
+                    <textarea class="speech-form-textarea disabled" id="speech-speaker-description" placeholder="Not used in Clone mode" disabled></textarea>
+                </div>
+
+                <div class="speech-form-group">
+                    <label class="speech-form-label">Audio Path (Clone)</label>
+                    <input type="text" class="speech-form-input" id="speech-audio-path" placeholder="Path to audio file (e.g. D:\Voices\sample.wav)">
+                </div>
+
+                <div class="speech-form-group">
+                    <label class="speech-form-label">Text Path (Clone)</label>
+                    <input type="text" class="speech-form-input" id="speech-text-path" placeholder="Path to transcript file">
+                </div>
+                
+                <div class="speech-form-group">
+                    <label class="speech-form-label">Scene Prompt (Optional)</label>
+                    <textarea class="speech-form-textarea" id="speech-scene-prompt" placeholder="Optional context for the voice generation..."></textarea>
+                </div>
+
+                <button class="create-voice-btn" id="speech-create-btn">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                    Create Voice
+                </button>
+            </div>
+          </div>
+        </div>
       </div>
     `,
 
@@ -599,6 +631,14 @@ function loadPage(page, container) {
     if (page === 'characters') {
       setTimeout(() => {
         initCharacters();
+      }, 100);
+    }
+
+    // Initialize speech page
+    if (page === 'speech') {
+      setTimeout(async () => {
+        const { initSpeech } = await import('./speech.js');
+        initSpeech();
       }, 100);
     }
   }, 150);
