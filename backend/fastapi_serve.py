@@ -55,6 +55,7 @@ from backend.database_director import (
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jslevsbvapopncjehhva.supabase.co")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpzbGV2c2J2YXBvcG5jamVoaHZhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgwNTQwOTMsImV4cCI6MjA3MzYzMDA5M30.DotbJM3IrvdVzwfScxOtsSpxq0xsj7XxI3DvdiqDSrE")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
@@ -112,8 +113,9 @@ class PipeQueues:
         self.transcribe_queue: asyncio.Queue[str] = asyncio.Queue()
         # Queue for sentences to be synthesized (Chat → TTS)
         self.sentence_queue: asyncio.Queue[TTSSentence] = asyncio.Queue()
-        # Queue for audio chunks to stream (TTS → WebSocket)
-        self.audio_queue: asyncio.Queue[AudioChunk] = asyncio.Queue()
+
+# Shared queues instance - created at module level, initialized in lifespan
+shared_queues: Optional[PipeQueues] = None
 
 ########################################
 ##--  Speech to Text Transcription  --##
@@ -385,7 +387,7 @@ class ChatFunctions:
 
         return messages
     
-    async def process_user_messages(self, queues: PipeQueues, user_message: str, user_name: str, llm_stream: 'LLMTextStream', sentence_queue: asyncio.Queue[TTSSentence], session_id: str,on_text_chunk: Optional[Callable[[str], Awaitable[None]]] = None) -> None:
+    async def process_user_messages(self, user_message: str, user_name: str, llm_stream: 'LLMTextStream', sentence_queue: asyncio.Queue[TTSSentence], session_id: str, on_text_chunk: Optional[Callable[[str], Awaitable[None]]] = None) -> None:
             """Processes User Messages"""
             
             self.conversation_history.append({"role": "user", "name": user_name, "content": user_message})
@@ -514,19 +516,6 @@ class LLMTextStream:
 ##--      Text to Speech Worker     --##
 ########################################
 
-def revert_delay_pattern(data: torch.Tensor, start_idx: int = 0) -> torch.Tensor:
-    """Undo Higgs delay pattern so decoded frames line up."""
-    if data.ndim != 2:
-        raise ValueError('Expected 2D tensor from audio tokenizer')
-    if data.shape[1] - data.shape[0] < start_idx:
-        raise ValueError('Invalid start_idx for delay pattern reversion')
-
-    out = []
-    num_codebooks = data.shape[0]
-    for i in range(num_codebooks):
-        out.append(data[i:(i + 1), i + start_idx:(data.shape[1] - num_codebooks + 1 + i)])
-    return torch.cat(out, dim=0)
-
 class TTSWorker:
     """Worker Synthesizes Sentences using Higgs Audio"""
 
@@ -602,7 +591,7 @@ class TTSWorker:
 
             chunk_index = 0
             try:
-                async for pcm_bytes in self.generate_audio_for_sentence(sentence.text):
+                async for pcm_bytes in self.generate_audio_for_sentence(sentence.text, sentence.voice_id):
                     audio_chunk = AudioChunk(
                         audio_bytes=pcm_bytes,
                         sentence_index=sentence.index,
@@ -768,12 +757,35 @@ class TTSWorker:
 class ConversationPipeline:
     """Orchestrates Complete LLM → TTS → Audio Pipeline"""
 
-    def __init__(self, api_key: str):
-        self.queues = PipeQueues()
-        self.chat = ChatFunctions()
-        self.llm_stream = LLMTextStream(self.queues, api_key)
-        self.tts_worker = TTSWorker(self.queues)
+    def __init__(self):
+        self.queues: Optional[PipeQueues] = None
+        self.chat: Optional[ChatFunctions] = None
+        self.llm_stream: Optional[LLMTextStream] = None
+        self.tts_worker: Optional[TTSWorker] = None
+        self.websocket: Optional[WebSocket] = None
         self.initialized = False
+
+    async def initialize(self):
+        """Initialize pipeline with shared queues"""
+        global shared_queues
+
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY environment variable not set")
+
+        # Create shared queues if not exists
+        if shared_queues is None:
+            shared_queues = PipeQueues()
+
+        self.queues = shared_queues
+        self.chat = ChatFunctions()
+        self.llm_stream = LLMTextStream(self.queues, OPENROUTER_API_KEY)
+        self.tts_worker = TTSWorker(self.queues)
+
+        # Initialize TTS engine
+        await self.tts_worker.initialize()
+
+        self.initialized = True
+        logger.info("ConversationPipeline initialized")
 
 
     async def start_pipeline(self):
@@ -788,22 +800,114 @@ class ConversationPipeline:
 
             if user_message and user_message.strip():
                 session_id = str(uuid.uuid4())
-                
-                await self.chat.process_user_message(
+
+                await self.chat.process_user_messages(
                     user_message=user_message,
+                    user_name=self.chat.user_name,
                     llm_stream=self.llm_stream,
                     sentence_queue=self.queues.sentence_queue,
                     session_id=session_id
                 )
 
-    async def conversate(self, user_message: str, character: Character, websocket: WebSocket):
-        """Main conversation flow: user message → LLM → TTS → audio stream"""
+    async def conversate(self, user_message: str, websocket: WebSocket, on_text_chunk: Optional[Callable[[str], Awaitable[None]]] = None) -> str:
+        """
+        Main conversation flow: user message → LLM → TTS → audio stream
 
-        # This is where calls will go (creates one easy to read top down flow).
-        # Do not put whole functions here, just calls.
+        Processes user message through LLM, extracts sentences, synthesizes audio,
+        and streams PCM directly to the websocket for browser playback.
+        """
+        self.websocket = websocket
+        session_id = str(uuid.uuid4())
 
-    async def audio_player(self):
-        """Streams PCM Audio to Browser for Real-time Playback"""
+        # Notify client that response is starting
+        await websocket.send_json({
+            "type": "response_start",
+            "session_id": session_id,
+        })
+
+        # Start audio streaming task (consumes from sentence_queue)
+        audio_task = asyncio.create_task(
+            self.stream_audio_to_websocket(websocket, session_id)
+        )
+
+        try:
+            # Process through LLM (populates sentence_queue)
+            await self.chat.process_user_messages(
+                user_message=user_message,
+                user_name=self.chat.user_name,
+                llm_stream=self.llm_stream,
+                sentence_queue=self.queues.sentence_queue,
+                session_id=session_id,
+                on_text_chunk=on_text_chunk
+            )
+
+            # Wait for audio streaming to complete
+            await audio_task
+
+        except Exception as e:
+            logger.error(f"Error in conversate: {e}")
+            audio_task.cancel()
+            raise
+
+        # Notify client that response is complete
+        await websocket.send_json({
+            "type": "response_complete",
+            "session_id": session_id,
+        })
+
+        return session_id
+
+    async def stream_audio_to_websocket(self, websocket: WebSocket, session_id: str):
+        """
+        Consume sentences from queue, synthesize audio, stream directly to websocket.
+
+        This runs concurrently with LLM processing for low-latency audio delivery.
+        """
+        while True:
+            try:
+                sentence = await asyncio.wait_for(
+                    self.queues.sentence_queue.get(),
+                    timeout=30.0  # Timeout after 30s of no sentences
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[Audio] Timeout waiting for sentences")
+                break
+
+            # Check for end sentinel
+            if sentence.is_final:
+                if sentence.is_session_complete:
+                    await websocket.send_json({
+                        "type": "audio_complete",
+                        "session_id": session_id,
+                    })
+                    break
+                continue
+
+            # Send audio stream start for this sentence
+            await websocket.send_json({
+                "type": "audio_chunk_start",
+                "session_id": session_id,
+                "sentence_index": sentence.index,
+                "character_id": sentence.character_id,
+                "character_name": sentence.character_name,
+            })
+
+            # Generate and stream audio chunks directly to websocket
+            chunk_index = 0
+            try:
+                async for pcm_bytes in self.tts_worker.generate_audio_for_sentence(
+                    sentence.text,
+                    sentence.voice_id
+                ):
+                    # Send binary audio directly to browser
+                    await websocket.send_bytes(pcm_bytes)
+                    chunk_index += 1
+
+                logger.info(f"[Audio] Sentence {sentence.index}: streamed {chunk_index} chunks")
+
+            except Exception as e:
+                logger.error(f"[Audio] Error generating audio for sentence {sentence.index}: {e}")
+                continue
 
 ########################################
 ##--        WebSocket Manager       --##
@@ -819,11 +923,11 @@ class WebSocketManager:
         # Event loop reference for async callback dispatching
         self.loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Shared queues for pipeline
-        self.queues = PipeQueues()
+        # Reference to shared queues (set in initialize)
+        self.queues: Optional[PipeQueues] = None
 
-        # Chat functions for LLM interaction
-        self.chat = ChatFunctions()
+        # Reference to conversation pipeline (set in initialize)
+        self.pipeline: Optional[ConversationPipeline] = None
 
         # Transcription handler with callbacks
         self.transcribe = Transcribe(
@@ -832,16 +936,18 @@ class WebSocketManager:
             on_transcription_finished=self.on_transcription_finished,
         )
 
-    async def initialize(self):
+    async def initialize(self, pipeline: 'ConversationPipeline'):
         """Initialize resources on app startup"""
-        self.loop = asyncio.get_running_loop()
-        # Pass event loop to transcribe for async callback dispatching
-        self.transcribe.loop = self.loop
-        logger.info("WebSocketManager initialized")
+        global shared_queues
 
-        self.chat = ChatFunctions(queues=self.queues, api_key=self.openrouter_api_key)
-        
-        await self.chat.initialize()
+        self.loop = asyncio.get_running_loop()
+        self.transcribe.loop = self.loop
+
+        # Use shared queues from pipeline
+        self.pipeline = pipeline
+        self.queues = shared_queues
+
+        logger.info("WebSocketManager initialized")
 
     async def shutdown(self):
         """Clean up resources on app shutdown"""
@@ -892,8 +998,8 @@ class WebSocketManager:
                     presence_penalty=float(settings_data.get("presence_penalty", 0.0)),
                     repetition_penalty=float(settings_data.get("repetition_penalty", 1.0))
                 )
-                if self.chat:
-                    self.chat.set_model_settings(model_settings)
+                if self.pipeline and self.pipeline.chat:
+                    self.pipeline.chat.set_model_settings(model_settings)
                 logger.info(f"Model settings updated: {model_settings.model}")
 
         except json.JSONDecodeError as e:
@@ -907,8 +1013,30 @@ class WebSocketManager:
             self.transcribe.feed_audio(audio_bytes)
 
     async def handle_user_message(self, user_message: str):
-        """Process manually sent user message"""
-        await self.queues.transcribe_queue.put(user_message)
+        """Process user message through conversation pipeline with direct audio streaming"""
+        if not self.pipeline or not self.websocket:
+            logger.error("Pipeline or websocket not initialized")
+            return
+
+        # Define callback to stream text chunks to client
+        async def on_text_chunk(chunk: str):
+            await self.send_text_to_client({
+                "type": "text_chunk",
+                "text": chunk
+            })
+
+        try:
+            await self.pipeline.conversate(
+                user_message=user_message,
+                websocket=self.websocket,
+                on_text_chunk=on_text_chunk
+            )
+        except Exception as e:
+            logger.error(f"Error in conversation: {e}")
+            await self.send_text_to_client({
+                "type": "error",
+                "message": str(e)
+            })
 
     async def send_text_to_client(self, data: dict):
         """Send JSON message to client"""
@@ -935,9 +1063,10 @@ class WebSocketManager:
         await self.send_text_to_client({"type": "stt_stabilized", "text": text})
 
     async def on_transcription_finished(self, user_message: str):
-        """Callback: final transcription complete"""
-        await self.queues.transcribe_queue.put(user_message)
+        """Callback: final transcription complete - triggers conversation pipeline"""
         await self.send_text_to_client({"type": "stt_finished", "text": user_message})
+        # Process through conversation pipeline with direct streaming
+        await self.handle_user_message(user_message)
 
     async def on_text_stream_start(self, message_id: str, character_name: str):
         """Notify client that text for a character is starting"""
@@ -970,13 +1099,13 @@ class WebSocketManager:
         # Send metadata first
         await self.send_text_to_client({
             "type": "audio_chunk_meta",
-            "message_id": audio_chunk.message_id,
-            "chunk_id": audio_chunk.chunk_id,
-            "character_name": audio_chunk.character_name,
-            "index": audio_chunk.index,
+            "session_id": audio_chunk.session_id,
+            "sentence_index": audio_chunk.sentence_index,
+            "chunk_index": audio_chunk.chunk_index,
+            "character_id": audio_chunk.character_id,
         })
         # Then send binary audio
-        await self.stream_audio_to_client(audio_chunk.audio_data)
+        await self.stream_audio_to_client(audio_chunk.audio_bytes)
 
     async def on_audio_stream_stop(self, message_id: str):
         """Notify client that audio stream has ended"""
@@ -996,9 +1125,22 @@ ws_manager = WebSocketManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Starting up services...")
-    await ws_manager.initialize()
+
+    # Initialize conversation pipeline (creates shared queues, loads TTS model)
+    await convo_pipe.initialize()
+    print("ConversationPipeline initialized")
+
+    # Initialize WebSocket manager with pipeline reference
+    await ws_manager.initialize(convo_pipe)
+    print("WebSocketManager initialized")
+
+    # Load active characters from database
+    convo_pipe.chat.active_characters = await convo_pipe.chat.get_active_characters()
+    print(f"Loaded {len(convo_pipe.chat.active_characters)} active characters")
+
     print("All services initialized!")
     yield
+
     print("Shutting down services...")
     await ws_manager.shutdown()
     print("All services shut down!")
