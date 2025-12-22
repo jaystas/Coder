@@ -32,7 +32,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Quer
 from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
-
 from backend.RealtimeSTT import AudioToTextRecorder
 from backend.stream2sentence import generate_sentences_async
 from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
@@ -287,6 +286,7 @@ class ChatFunctions:
         self.conversation_id: Optional[str] = None
         self.model_settings: Optional[ModelSettings] = None
         self.active_characters: List[Character] = []
+        self.user_name: str = "Jay"
 
     async def start_new_chat(self):
         """Start a new chat session"""
@@ -307,18 +307,34 @@ class ChatFunctions:
 
         self.conversation_history = []
 
-    def wrap_with_character_tags(self, text: str, character_name: str) -> str:
+    def wrap_character_tags(self, text: str, character_name: str) -> str:
         """Wrap response text with character name XML tags for conversation history."""
 
         return f"<{character_name}>{text}</{character_name}>"
 
-    def create_character_instruction_message(self, character: Character) -> Dict[str, str]:
-        """Create character instruction message for group chat with character tags."""
+    def character_instruction_message(self, character: Character) -> Dict[str, str]:
+        """Create Character Instruction Message."""
 
         return {
             'role': 'system',
             'content': f'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}\'s reply. Do not respond for/as anyone else.'
         }
+    
+    def get_model_settings(self) -> ModelSettings:
+        """Get current model settings for the LLM request"""
+        if self.model_settings is None:
+
+            return ModelSettings(
+                model="meta-llama/llama-3.1-8b-instruct",
+                temperature=0.7,
+                top_p=0.9,
+                min_p=0.0,
+                top_k=40,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                repetition_penalty=1.0
+            )
+        return self.model_settings
 
     def parse_character_mentions(self, message: str, active_characters: List[Character]) -> List[Character]:
         """Parse a message for character mentions in order of appearance"""
@@ -352,23 +368,7 @@ class ChatFunctions:
 
         return mentioned_characters
     
-    def get_model_settings(self) -> ModelSettings:
-        """Get current model settings for the LLM request"""
-        if self.model_settings is None:
-
-            return ModelSettings(
-                model="meta-llama/llama-3.1-8b-instruct",
-                temperature=0.7,
-                top_p=0.9,
-                min_p=0.0,
-                top_k=40,
-                frequency_penalty=0.0,
-                presence_penalty=0.0,
-                repetition_penalty=1.0
-            )
-        return self.model_settings
-    
-    def _build_messages_for_character(self, character: Character) -> List[Dict[str, str]]:
+    def build_messages_for_character(self, character: Character) -> List[Dict[str, str]]:
         """Build the message list for OpenRouter API call."""
 
         messages = []
@@ -381,36 +381,34 @@ class ChatFunctions:
         messages.extend(self.conversation_history)
 
         # Instruction for this character
-        messages.append({"role": "system", "content": f"Respond as {character.name}. Provide only {character.name}'s reply. Do not respond as anyone else."})
+        messages.append(self.character_instruction_message(character))
 
         return messages
-
-    async def prepare_conversation_structure(self, messages: str, character: Character, user_name: str = "Jay", model_settings: ModelSettings = None, user_message=str):
-        """Include Conversation History, Model Settings etc. with User Message"""
-
-        self.conversation_history.append({"role": "user", "name": user_name, "content": user_message})
-
-        mentioned_characters = self.parse_character_mentions(message=user_message, active_characters=self.active_characters)
-
-    # In your ConversationPipeline or a dedicated consumer
-    async def process_user_messages(self, queues: PipeQueues, chat):
-        """Consume user messages and send to LLM"""
-        while True:
-            # Get the next user message (blocks until one is available)
-            user_message: str = await queues.transcribe_queue.get()
+    
+    async def process_user_messages(self, queues: PipeQueues, user_message: str, user_name: str, llm_stream: 'LLMTextStream', sentence_queue: asyncio.Queue[TTSSentence], session_id: str,on_text_chunk: Optional[Callable[[str], Awaitable[None]]] = None) -> None:
+            """Processes User Messages"""
             
-            if user_message and user_message.strip():
-                # Now build the full request for OpenRouter
-                await self.send_to_llm(user_message, chat)
+            self.conversation_history.append({"role": "user", "name": user_name, "content": user_message})
 
+            responding_characters = self.parse_character_mentions(message=user_message, active_characters=self.active_characters)
 
-    async def send_message_to_character(self, user_message: str, character: Character):
-        """Send user message to a character and get streaming response"""
-        # TODO: Integrate with streaming pipeline
-        pass
+            for i, character in enumerate(responding_characters):
+                is_last = (i == len(responding_characters) - 1)
 
+                messages = self.build_messages_for_character(character)
 
+                full_response = await llm_stream.stream_character_response(
+                    messages=messages,
+                    character=character,
+                    session_id=session_id,
+                    model_settings=self.get_model_settings(),
+                    sentence_queue=sentence_queue,
+                    on_text_chunk=on_text_chunk,
+                    is_last_character=is_last
+                )
 
+                response_wrapped = self.wrap_character_tags(full_response, character.name)
+                self.conversation_history.append({"role": "assistant", "name": character.name, "content": response_wrapped})
 
 ########################################
 ##--      Text Stream Processor     --##
@@ -452,7 +450,12 @@ class LLMTextStream:
                 top_p=model_settings.top_p,
                 frequency_penalty=model_settings.frequency_penalty,
                 presence_penalty=model_settings.presence_penalty,
-                stream=True
+                stream=True,
+                extra_body={
+                    "top_k": model_settings.top_k,
+                    "min_p": model_settings.min_p,
+                    "repetition_penalty": model_settings.repetition_penalty,
+                }
             )
 
             async def chunk_generator() -> AsyncGenerator[str, None]:
@@ -506,7 +509,6 @@ class LLMTextStream:
         logger.info(f"[LLM] {character.name} complete: {sentence_index} sentences")
 
         return full_response
-
 
 ########################################
 ##--      Text to Speech Worker     --##
@@ -769,10 +771,30 @@ class ConversationPipeline:
     def __init__(self, api_key: str):
         self.queues = PipeQueues()
         self.chat = ChatFunctions()
-        self.llm_processor = LLMTextStream(self.queues, api_key)
+        self.llm_stream = LLMTextStream(self.queues, api_key)
         self.tts_worker = TTSWorker(self.queues)
         self.initialized = False
 
+
+    async def start_pipeline(self):
+        """Start the voice transcription → LLM → TTS pipeline as a background task"""
+        self.consumer_task = asyncio.create_task(self.get_user_messages())
+
+    async def get_user_messages(self):
+        """Background task: get user message from transcribe queue and process."""
+
+        while True:
+            user_message: str = await self.queues.transcribe_queue.get()
+
+            if user_message and user_message.strip():
+                session_id = str(uuid.uuid4())
+                
+                await self.chat.process_user_message(
+                    user_message=user_message,
+                    llm_stream=self.llm_stream,
+                    sentence_queue=self.queues.sentence_queue,
+                    session_id=session_id
+                )
 
     async def conversate(self, user_message: str, character: Character, websocket: WebSocket):
         """Main conversation flow: user message → LLM → TTS → audio stream"""
@@ -780,12 +802,8 @@ class ConversationPipeline:
         # This is where calls will go (creates one easy to read top down flow).
         # Do not put whole functions here, just calls.
 
-
     async def audio_player(self):
         """Streams PCM Audio to Browser for Real-time Playback"""
-
-
-
 
 ########################################
 ##--        WebSocket Manager       --##
@@ -920,6 +938,53 @@ class WebSocketManager:
         """Callback: final transcription complete"""
         await self.queues.transcribe_queue.put(user_message)
         await self.send_text_to_client({"type": "stt_finished", "text": user_message})
+
+    async def on_text_stream_start(self, message_id: str, character_name: str):
+        """Notify client that text for a character is starting"""
+        await self.send_text_to_client({
+            "type": "text_stream_start",
+            "message_id": message_id,
+            "character_name": character_name,
+            "timestamp": time.time()
+        })
+
+    async def on_text_stream_stop(self, message_id: str):
+        """Notify client that text stream has ended"""
+        await self.send_text_to_client({
+            "type": "text_stream_stop",
+            "message_id": message_id,
+            "timestamp": time.time()
+        })
+
+    async def on_audio_stream_start(self, message_id: str, character_name: str):
+        """Notify client that audio for a character is starting"""
+        await self.send_text_to_client({
+            "type": "audio_stream_start",
+            "message_id": message_id,
+            "character_name": character_name,
+            "timestamp": time.time()
+        })
+
+    async def on_audio_chunk(self, audio_chunk: AudioChunk):
+        """Send audio chunk to client"""
+        # Send metadata first
+        await self.send_text_to_client({
+            "type": "audio_chunk_meta",
+            "message_id": audio_chunk.message_id,
+            "chunk_id": audio_chunk.chunk_id,
+            "character_name": audio_chunk.character_name,
+            "index": audio_chunk.index,
+        })
+        # Then send binary audio
+        await self.stream_audio_to_client(audio_chunk.audio_data)
+
+    async def on_audio_stream_stop(self, message_id: str):
+        """Notify client that audio stream has ended"""
+        await self.send_text_to_client({
+            "type": "audio_stream_stop",
+            "message_id": message_id,
+            "timestamp": time.time()
+        })
 
 ########################################
 ##--           FastAPI App          --##
