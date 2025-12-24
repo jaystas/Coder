@@ -93,10 +93,8 @@ class PipeQueues:
 
     def __init__(self):
 
-        self.transcribed_text = asyncio.Queue()
-        self.response_queue = asyncio.Queue()
+        self.transcribe_queue = asyncio.Queue()
         self.sentence_queue = asyncio.Queue()
-        self.tts_sentence_queue = asyncio.Queue()
         self.audio_queue = asyncio.Queue()
 
 ########################################
@@ -244,7 +242,7 @@ class Transcribe:
 ##--       LLM Chat Functions       --##
 ########################################
 
-class ChatFunctions:
+class ChatLLM:
     """"""
 
     def __init__(self, queues: PipeQueues, api_key: str):
@@ -253,8 +251,6 @@ class ChatFunctions:
         self.conversation_id: Optional[str] = None
         self.queues = queues
         self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
-
-        # Model and character state
         self.model_settings: Optional[ModelSettings] = None
         self.active_characters: List[Character] = []
 
@@ -262,6 +258,10 @@ class ChatFunctions:
         """Start a new chat session"""
         self.conversation_history = []
         self.conversation_id = str(uuid.uuid4())
+
+    async def get_active_characters(self) -> List[Character]:
+        """Get active characters from database"""
+        return await db.get_active_characters()
 
     def set_model_settings(self, model_settings: ModelSettings):
         """Set model settings for LLM requests"""
@@ -363,10 +363,10 @@ class ChatFunctions:
 
                 messages = self.build_messages_for_character(character)
 
-                full_response = await llm_stream.stream_character_response(
+                full_response = await self.chatllm.stream_character_response(
                     messages=messages,
                     character=character,
-                    session_id=session_id,
+                    session_id=session_id, # remove (but don't want to break anything)
                     model_settings=self.get_model_settings(),
                     sentence_queue=sentence_queue,
                     on_text_chunk=on_text_chunk,
@@ -479,7 +479,7 @@ def revert_delay_pattern(data: torch.Tensor, start_idx: int = 0) -> torch.Tensor
         out.append(data[i:(i + 1), i + start_idx:(data.shape[1] - num_codebooks + 1 + i)])
     return torch.cat(out, dim=0)
 
-class TTSWorker:
+class Speech:
     """Worker Synthesizes Sentences using Higgs Audio"""
 
     def __init__(self, queues: PipeQueues):
