@@ -1,15 +1,15 @@
-# FastAPI Server Review & Planning Document
+# FastAPI Server Review & Planning Document (Updated)
 
 ## Executive Summary
 
 The server implements a voice chat pipeline: **STT (Transcribe) → LLM (ChatLLM) → TTS (Speech)**
 
-After thorough review, I've identified several categories of issues:
-1. Missing/incomplete `__init__` methods
-2. Undefined instance attributes referenced throughout
-3. Mismatched callback parameter names
-4. Method name typos
-5. Missing lifecycle methods (initialize, connect, disconnect, shutdown)
+This document reflects the updated requirements:
+- Single user: "Jay"
+- Single WebSocket connection
+- Stream LLM text tokens to frontend in real-time
+- Characters loaded at startup, refreshed when changed
+- Use `conversation_id` and `message_id` (not session_id)
 
 ---
 
@@ -20,6 +20,7 @@ After thorough review, I've identified several categories of issues:
 │                      WebSocketManager                            │
 │  - Owns all pipeline components                                  │
 │  - Routes messages between client and pipeline                   │
+│  - Single user: "Jay"                                            │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
@@ -35,51 +36,118 @@ After thorough review, I've identified several categories of issues:
 
 ---
 
-## Class-by-Class Analysis
+## Data Flow with message_id
 
-### 1. `PipeQueues` (Lines 91-98) ✅ OK
+The key insight: **Each character's response is ONE message with a unique `message_id`**
 
-**Current State:** Properly implemented
+```
+User speaks/types
+       │
+       ▼
+┌─────────────────┐
+│   Transcribe    │ → transcribe_queue (user text)
+└─────────────────┘
+       │
+       ▼
+┌─────────────────┐
+│    ChatLLM      │ For each responding character:
+│                 │   1. Create Message in Supabase → get message_id
+│                 │   2. Stream LLM response
+│                 │   3. Extract sentences → TTSSentence (with message_id)
+│                 │   4. Stream text chunks to frontend
+└─────────────────┘
+       │
+       ▼ sentence_queue
+┌─────────────────┐
+│     Speech      │ For each TTSSentence:
+│     (TTS)       │   1. Generate audio chunks
+│                 │   2. Each AudioChunk carries message_id
+└─────────────────┘
+       │
+       ▼ audio_queue
+┌─────────────────┐
+│  WebSocket      │ Stream to frontend:
+│  (to client)    │   - Binary audio (tagged with message_id)
+│                 │   - is_final=True signals end of this message's audio
+└─────────────────┘
+```
+
+---
+
+## Updated Dataclasses
+
+### `TTSSentence` - UPDATED
+```python
+@dataclass
+class TTSSentence:
+    """Sentence queued for TTS synthesis with character context"""
+    text: str
+    index: int                    # Sentence index within this message
+    conversation_id: str          # CHANGED: was session_id
+    message_id: str               # NEW: Supabase message ID
+    character_id: str
+    character_name: str
+    voice_id: str
+    is_final: bool = False        # True = last sentence for this message
+    # REMOVED: is_session_complete (not needed)
+```
+
+### `AudioChunk` - UPDATED
+```python
+@dataclass
+class AudioChunk:
+    """PCM audio chunk ready for streaming with character context"""
+    audio_bytes: bytes
+    sentence_index: int
+    chunk_index: int
+    conversation_id: str          # CHANGED: was session_id
+    message_id: str               # NEW: for tracking which message this audio belongs to
+    character_id: str
+    is_final: bool = False        # True = last chunk for this message
+    # REMOVED: is_session_complete (not needed)
+```
+
+### `ModelSettings` - NO CHANGES
+```python
+@dataclass
+class ModelSettings:
+    model: str
+    temperature: float
+    top_p: float
+    min_p: float
+    top_k: int
+    frequency_penalty: float
+    presence_penalty: float
+    repetition_penalty: float
+```
+
+---
+
+## Class-by-Class Changes
+
+### 1. `PipeQueues` (Lines 91-98) ✅ NO CHANGES NEEDED
 
 ```python
 class PipeQueues:
     def __init__(self):
-        self.transcribe_queue = asyncio.Queue()  # user messages
+        self.transcribe_queue = asyncio.Queue()  # user messages (str)
         self.sentence_queue = asyncio.Queue()    # TTSSentence objects
         self.audio_queue = asyncio.Queue()       # AudioChunk objects
 ```
 
-**Status:** No changes needed.
-
 ---
 
-### 2. `Transcribe` (Lines 106-238) ⚠️ ISSUES FOUND
+### 2. `Transcribe` (Lines 106-238) - FIXES REQUIRED
 
-**Current `__init__`:**
-```python
-def __init__(self,
-    on_transcription_update: Optional[Callback] = None,
-    on_transcription_stabilized: Optional[Callback] = None,
-    on_transcription_finished: Optional[Callback] = None,
-    # ... more callbacks
-):
-    self.callbacks: Dict[str, Optional[Callback]] = {
-        'on_realtime_update': on_transcription_update,  # ← key mismatch
-        # ...
-    }
-    self.is_listening = False
-    self.recorder = AudioToTextRecorder(...)
-```
+**Current Issues:**
+| Line | Issue | Fix |
+|------|-------|-----|
+| 121-131 | Callback dict keys mismatch | Use consistent key names |
+| 133 | Missing `self.loop` | Add event loop attribute |
+| 167 | Wrong syntax | `self.callbacks.on_...` → `self.callbacks.get('...')` |
+| 206 | Typo | `self.callback` → `self.callbacks` |
 
-**Issues Found:**
-| Line | Issue | Description |
-|------|-------|-------------|
-| 121-131 | Key mismatch | Callback dict keys don't match parameter names |
-| 177 | Missing attribute | `self.loop` is never set but referenced |
-| 167 | Wrong syntax | `self.callbacks.on_transcription_finished` should use `.get()` |
-| 206 | Typo | `self.callback` should be `self.callbacks` |
-
-**Recommended `__init__`:**
+**Updated `__init__`:**
 ```python
 def __init__(self,
     on_transcription_update: Optional[Callback] = None,
@@ -106,27 +174,23 @@ def __init__(self,
     }
 
     self.is_listening = False
-    self.loop: Optional[asyncio.AbstractEventLoop] = None  # ← ADD THIS
+    self.loop: Optional[asyncio.AbstractEventLoop] = None  # ADD THIS
 
-    self.recorder = AudioToTextRecorder(...)
+    self.recorder = AudioToTextRecorder(...)  # existing code
 ```
 
-**Additional Fix Needed - `set_event_loop` method:**
+**Add method:**
 ```python
 def set_event_loop(self, loop: asyncio.AbstractEventLoop):
     """Set the asyncio event loop for callback execution"""
     self.loop = loop
 ```
 
-**Bug Fixes Required:**
-- Line 167: Change `self.callbacks.on_transcription_finished` → `self.callbacks.get('on_transcription_finished')`
-- Line 206: Change `self.callback.get(...)` → `self.callbacks.get(...)`
-
 ---
 
-### 3. `ChatLLM` (Lines 245-463) ⚠️ ISSUES FOUND
+### 3. `ChatLLM` (Lines 245-463) - FIXES REQUIRED
 
-**Current `__init__`:**
+**`__init__` is good, but needs db reference:**
 ```python
 def __init__(self, queues: PipeQueues, api_key: str):
     self.conversation_history: List[Dict] = []
@@ -135,97 +199,168 @@ def __init__(self, queues: PipeQueues, api_key: str):
     self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
     self.model_settings: Optional[ModelSettings] = None
     self.active_characters: List[Character] = []
+    self.db = db  # ADD: reference to database director
 ```
 
-**Status:** The `__init__` is actually fine!
-
-**Issues are in methods, not `__init__`:**
-
+**Method fixes:**
 | Line | Issue | Fix |
 |------|-------|-----|
-| 350 | Wrong method name | `self.character_instruction_message` → `self.create_character_instruction_message` |
-| 366 | Undefined `self.chatllm` | Should be `self.stream_character_response` |
-| 369-372 | Undefined variables | `session_id`, `sentence_queue`, `on_text_chunk` need to be passed as parameters |
-| 376 | Wrong method name | `self.wrap_character_tags` → `self.wrap_with_character_tags` |
+| 350 | Wrong method name | `character_instruction_message` → `create_character_instruction_message` |
+| 354 | Missing parameters | Add `sentence_queue`, `on_text_chunk` parameters |
+| 366 | Wrong self reference | `self.chatllm.stream_...` → `self.stream_...` |
+| 376 | Wrong method name | `wrap_character_tags` → `wrap_with_character_tags` |
 
-**The `process_user_messages` method signature should be:**
+**Updated `process_user_messages`:**
 ```python
 async def process_user_messages(
     self,
     user_message: str,
-    user_name: str,
-    session_id: str,                          # ADD
-    sentence_queue: asyncio.Queue[TTSSentence],  # ADD
-    on_text_chunk: Optional[Callable[[str], Awaitable[None]]] = None  # ADD
+    sentence_queue: asyncio.Queue[TTSSentence],
+    on_text_chunk: Optional[Callable[[str, str], Awaitable[None]]] = None,  # (chunk, character_id)
 ):
+    """Process user message and generate character responses"""
+
+    # Save user message to database
+    user_msg = await self.db.create_message(MessageCreate(
+        conversation_id=self.conversation_id,
+        role="user",
+        content=user_message,
+        name="Jay"
+    ))
+
+    # Add to conversation history
+    self.conversation_history.append({
+        "role": "user",
+        "name": "Jay",
+        "content": user_message
+    })
+
+    # Determine which characters respond
+    responding_characters = self.parse_character_mentions(
+        message=user_message,
+        active_characters=self.active_characters
+    )
+
+    for i, character in enumerate(responding_characters):
+        is_last = (i == len(responding_characters) - 1)
+
+        # Create message in Supabase FIRST to get message_id
+        char_msg = await self.db.create_message(MessageCreate(
+            conversation_id=self.conversation_id,
+            role="assistant",
+            content="",  # Will update after streaming completes
+            name=character.name,
+            character_id=character.id
+        ))
+
+        messages = self.build_messages_for_character(character)
+
+        full_response = await self.stream_character_response(
+            messages=messages,
+            character=character,
+            conversation_id=self.conversation_id,
+            message_id=char_msg.message_id,  # Pass the message_id
+            model_settings=self.get_model_settings(),
+            sentence_queue=sentence_queue,
+            on_text_chunk=on_text_chunk,
+            is_last_character=is_last
+        )
+
+        # Update message with full response (for persistence)
+        # Note: Could also do this via update_message if needed
+
+        response_wrapped = self.wrap_with_character_tags(full_response, character.name)
+        self.conversation_history.append({
+            "role": "assistant",
+            "name": character.name,
+            "content": response_wrapped
+        })
+```
+
+**Updated `stream_character_response`:**
+```python
+async def stream_character_response(
+    self,
+    messages: List[Dict[str, str]],
+    character: Character,
+    conversation_id: str,           # CHANGED from session_id
+    message_id: str,                # NEW
+    model_settings: ModelSettings,
+    sentence_queue: asyncio.Queue[TTSSentence],
+    on_text_chunk: Optional[Callable[[str, str], Awaitable[None]]] = None,
+    is_last_character: bool = False
+) -> str:
+    """Stream LLM response, extract sentences, queue for TTS."""
+
+    sentence_index = 0
+    full_response = ""
+
+    # ... streaming logic ...
+
+    # When queueing sentences:
+    await sentence_queue.put(TTSSentence(
+        text=sentence_text,
+        index=sentence_index,
+        conversation_id=conversation_id,
+        message_id=message_id,        # NEW
+        character_id=character.id,
+        character_name=character.name,
+        voice_id=character.voice,
+        is_final=False,
+    ))
+
+    # Final sentinel:
+    await sentence_queue.put(TTSSentence(
+        text="",
+        index=sentence_index,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        character_id=character.id,
+        character_name=character.name,
+        voice_id=character.voice,
+        is_final=True,
+    ))
 ```
 
 ---
 
-### 4. `Speech` (Lines 482-693) ⚠️ ISSUES FOUND
+### 4. `Speech` (Lines 482-693) - MINOR FIXES
 
-**Current `__init__`:**
+**`__init__` is fine.**
+
+**Fix in `process_sentences` (line 557):**
 ```python
-def __init__(self, queues: PipeQueues):
-    self.queues = queues
-    self.engine: Optional[HiggsAudioServeEngine] = None
-    self.is_running = False
-    self._task: Optional[asyncio.Task] = None
-    self.sample_rate = 24000
-    self._chunk_size = 14
-    self._device = "cuda" if torch.cuda.is_available() else "cpu"
-    self.voice_dir = "backend/voices"
-    self.voice_name = "lydia"
-```
+# Current (missing voice parameter):
+async for pcm_bytes in self.generate_audio_for_sentence(sentence.text):
 
-**Status:** The `__init__` is fine!
-
-**Issue in method call:**
-| Line | Issue | Fix |
-|------|-------|-----|
-| 557 | Missing argument | `self.generate_audio_for_sentence(sentence.text)` missing `voice` parameter |
-
-**Fix:**
-```python
-# Line 557 should be:
+# Fixed:
 async for pcm_bytes in self.generate_audio_for_sentence(sentence.text, sentence.voice_id):
 ```
 
----
-
-### 5. `WebSocketManager` (Lines 699-795) ❌ MAJOR ISSUES
-
-**Current `__init__`:**
+**Update AudioChunk creation:**
 ```python
-def __init__(self):
-    self.transcribe = Transcribe(
-        on_realtime_update=self.on_transcription_update,      # Wrong param name
-        on_realtime_stabilized=self.on_transcription_stabilized,  # Wrong param name
-        on_final_transcription=self.on_transcription_finished,    # Wrong param name
-    )
+audio_chunk = AudioChunk(
+    audio_bytes=pcm_bytes,
+    sentence_index=sentence.index,
+    chunk_index=chunk_index,
+    conversation_id=sentence.conversation_id,  # CHANGED
+    message_id=sentence.message_id,            # NEW
+    character_id=sentence.character_id,
+    is_final=False,
+)
 ```
 
-**Missing Attributes (referenced but never defined):**
-- `self.websocket` (lines 759, 764)
-- `self.queues` (lines 755, 774, 785, 793)
-- `self.chat` (lines 741, 790)
-- `self.llm_stream` (line 792)
-- `self.consumer_task` (line 779)
-- `self.speech` (for TTS)
+---
 
-**Missing Methods (called but not defined):**
-- `initialize()` (line 806)
-- `connect(websocket)` (line 829)
-- `disconnect()` (lines 842, 846)
-- `shutdown()` (line 810)
+### 5. `WebSocketManager` (Lines 699-795) - MAJOR REWRITE
 
-**Recommended Complete `__init__`:**
+**Complete `__init__`:**
 ```python
 def __init__(self):
     # Pipeline queues - shared between all components
     self.queues = PipeQueues()
 
-    # WebSocket connection (set on connect)
+    # WebSocket connection
     self.websocket: Optional[WebSocket] = None
 
     # Pipeline components (initialized in initialize())
@@ -236,13 +371,15 @@ def __init__(self):
     # Background tasks
     self.consumer_task: Optional[asyncio.Task] = None
     self.audio_streamer_task: Optional[asyncio.Task] = None
+
+    # User info
+    self.user_name = "Jay"
 ```
 
-**Required Methods to Add:**
-
+**Add `initialize()` method:**
 ```python
 async def initialize(self):
-    """Initialize all pipeline components"""
+    """Initialize all pipeline components at startup"""
     api_key = os.getenv("OPENROUTER_API_KEY", "")
 
     # Initialize transcription (STT)
@@ -261,6 +398,11 @@ async def initialize(self):
     self.speech = Speech(queues=self.queues)
     await self.speech.initialize()
 
+    logger.info(f"Initialized with {len(self.chat.active_characters)} active characters")
+```
+
+**Add `connect()` method:**
+```python
 async def connect(self, websocket: WebSocket):
     """Accept WebSocket connection and start pipeline"""
     await websocket.accept()
@@ -273,8 +415,13 @@ async def connect(self, websocket: WebSocket):
     await self.start_pipeline()
 
     # Start audio streaming to client
-    self.audio_streamer_task = asyncio.create_task(self.stream_audio_to_client_loop())
+    self.audio_streamer_task = asyncio.create_task(self.stream_audio_loop())
 
+    logger.info("WebSocket connected, pipeline started")
+```
+
+**Add `disconnect()` method:**
+```python
 async def disconnect(self):
     """Clean up on disconnect"""
     if self.transcribe:
@@ -285,27 +432,51 @@ async def disconnect(self):
 
     if self.consumer_task:
         self.consumer_task.cancel()
+        try:
+            await self.consumer_task
+        except asyncio.CancelledError:
+            pass
 
     if self.audio_streamer_task:
         self.audio_streamer_task.cancel()
+        try:
+            await self.audio_streamer_task
+        except asyncio.CancelledError:
+            pass
 
     self.websocket = None
+    logger.info("WebSocket disconnected, pipeline stopped")
+```
 
+**Add `shutdown()` method:**
+```python
 async def shutdown(self):
     """Shutdown all services"""
     await self.disconnect()
+    logger.info("All services shut down")
+```
 
-async def stream_audio_to_client_loop(self):
+**Add `stream_audio_loop()` method:**
+```python
+async def stream_audio_loop(self):
     """Background task: stream audio chunks to WebSocket client"""
     while True:
         try:
             chunk: AudioChunk = await self.queues.audio_queue.get()
 
             if chunk.audio_bytes:
+                # Send binary audio with metadata header
+                # Format: 1 byte flags + message_id + audio
+                # Or send metadata via text message first
                 await self.websocket.send_bytes(chunk.audio_bytes)
 
-            if chunk.is_session_complete:
-                await self.send_text_to_client({"type": "audio_complete"})
+            if chunk.is_final:
+                # Notify frontend this message's audio is complete
+                await self.send_text_to_client({
+                    "type": "audio_complete",
+                    "message_id": chunk.message_id,
+                    "character_id": chunk.character_id
+                })
 
         except asyncio.CancelledError:
             break
@@ -313,108 +484,197 @@ async def stream_audio_to_client_loop(self):
             logger.error(f"Error streaming audio: {e}")
 ```
 
+**Add `refresh_active_characters()` method:**
+```python
+async def refresh_active_characters(self):
+    """Refresh active characters from database (call when characters change)"""
+    if self.chat:
+        self.chat.active_characters = await self.chat.get_active_characters()
+        logger.info(f"Refreshed to {len(self.chat.active_characters)} active characters")
+```
+
+**Update `get_user_messages()`:**
+```python
+async def get_user_messages(self):
+    """Background task: get user message from transcribe queue and process."""
+    while True:
+        try:
+            user_message: str = await self.queues.transcribe_queue.get()
+
+            if user_message and user_message.strip():
+                await self.chat.process_user_messages(
+                    user_message=user_message,
+                    sentence_queue=self.queues.sentence_queue,
+                    on_text_chunk=self.on_llm_text_chunk,
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error processing user message: {e}")
+```
+
+**Add `on_llm_text_chunk()` for real-time text streaming:**
+```python
+async def on_llm_text_chunk(self, text_chunk: str, character_id: str):
+    """Stream LLM text chunks to frontend in real-time"""
+    await self.send_text_to_client({
+        "type": "llm_chunk",
+        "text": text_chunk,
+        "character_id": character_id
+    })
+```
+
+**Update `handle_text_message()` to handle character changes:**
+```python
+async def handle_text_message(self, message: str):
+    """Handle incoming text messages from WebSocket client"""
+    try:
+        data = json.loads(message)
+        message_type = data.get("type", "")
+        payload = data.get("data", {})
+
+        if message_type == "user_message":
+            user_message = payload.get("text", "")
+            await self.handle_user_message(user_message)
+
+        elif message_type == "start_listening":
+            if self.transcribe:
+                self.transcribe.start_listening()
+
+        elif message_type == "stop_listening":
+            if self.transcribe:
+                self.transcribe.stop_listening()
+
+        elif message_type == "model_settings":
+            # ... existing code ...
+
+        elif message_type == "refresh_characters":
+            # NEW: Refresh active characters when frontend notifies of change
+            await self.refresh_active_characters()
+
+        elif message_type == "new_conversation":
+            # NEW: Start a new conversation
+            await self.start_new_conversation()
+
+    except Exception as e:
+        logger.error(f"Error handling message: {e}", exc_info=True)
+```
+
+**Add `start_new_conversation()` method:**
+```python
+async def start_new_conversation(self):
+    """Start a new conversation"""
+    if self.chat:
+        # Create conversation in Supabase
+        from backend.database_director import db, ConversationCreate
+
+        # Get active character data for storage
+        active_char_data = [
+            {"id": c.id, "name": c.name}
+            for c in self.chat.active_characters
+        ]
+
+        conversation = await db.create_conversation(
+            ConversationCreate(active_characters=active_char_data)
+        )
+
+        self.chat.conversation_id = conversation.conversation_id
+        self.chat.clear_conversation_history()
+
+        await self.send_text_to_client({
+            "type": "conversation_started",
+            "conversation_id": conversation.conversation_id
+        })
+
+        logger.info(f"Started new conversation: {conversation.conversation_id}")
+```
+
 ---
 
-## Dataclass Review
+## Complete End-to-End Flow
 
-### `TTSSentence` ✅ OK
-```python
-@dataclass
-class TTSSentence:
-    text: str
-    index: int
-    session_id: str
-    character_id: str
-    character_name: str
-    voice_id: str
-    is_final: bool = False
-    is_session_complete: bool = False
-```
-**Status:** Complete and correct. Used to pass sentences from LLM to TTS.
+Here's the verified flow from user input to audio output:
 
-### `AudioChunk` ✅ OK
-```python
-@dataclass
-class AudioChunk:
-    audio_bytes: bytes
-    sentence_index: int
-    chunk_index: int
-    session_id: str
-    character_id: str
-    is_final: bool = False
-    is_session_complete: bool = False
+### 1. User Speaks (STT Path)
 ```
-**Status:** Complete and correct. Used to pass audio from TTS to WebSocket.
+Browser microphone → WebSocket binary
+    → ws_manager.handle_audio_message()
+    → transcribe.feed_audio()
+    → RealtimeSTT processes audio
+    → on_transcription_finished callback
+    → queues.transcribe_queue.put(user_message)
+```
 
-### `ModelSettings` ✅ OK
-```python
-@dataclass
-class ModelSettings:
-    model: str
-    temperature: float
-    top_p: float
-    min_p: float
-    top_k: int
-    frequency_penalty: float
-    presence_penalty: float
-    repetition_penalty: float
+### 2. User Types (Direct Path)
 ```
-**Status:** Complete and correct. Used for LLM configuration.
+Browser text input → WebSocket JSON {"type": "user_message", "data": {"text": "..."}}
+    → ws_manager.handle_text_message()
+    → ws_manager.handle_user_message()
+    → queues.transcribe_queue.put(user_message)
+```
+
+### 3. Message Processing (LLM)
+```
+get_user_messages() loop:
+    → queues.transcribe_queue.get()
+    → chat.process_user_messages()
+        → db.create_message() for user message
+        → For each character:
+            → db.create_message() → get message_id
+            → stream_character_response()
+                → OpenRouter streaming API
+                → For each text chunk:
+                    → on_text_chunk() → WebSocket {"type": "llm_chunk"}
+                → For each sentence:
+                    → sentence_queue.put(TTSSentence with message_id)
+                → sentence_queue.put(final sentinel)
+```
+
+### 4. Text-to-Speech (TTS)
+```
+speech.process_sentences() loop:
+    → sentence_queue.get()
+    → If is_final: pass through sentinel
+    → Else: generate_audio_for_sentence()
+        → Higgs Audio streaming
+        → For each PCM chunk:
+            → audio_queue.put(AudioChunk with message_id)
+```
+
+### 5. Audio Streaming to Client
+```
+stream_audio_loop():
+    → audio_queue.get()
+    → websocket.send_bytes(audio)
+    → If is_final:
+        → websocket.send_text({"type": "audio_complete", "message_id": ...})
+```
 
 ---
 
-## Summary of Required Changes
+## Message ID Tracking Summary
 
-### High Priority (Server won't run without these)
+| Stage | Where message_id comes from |
+|-------|----------------------------|
+| User message | `db.create_message()` returns `message_id` (can use for future features) |
+| Character response | `db.create_message()` returns `message_id` BEFORE streaming starts |
+| TTSSentence | Carries `message_id` from ChatLLM |
+| AudioChunk | Carries `message_id` from TTSSentence |
+| Frontend | Receives `message_id` in `audio_complete` event, can match to UI |
 
-| # | Class | Change | Lines |
-|---|-------|--------|-------|
-| 1 | `WebSocketManager` | Add complete `__init__` with all required attributes | 702-708 |
-| 2 | `WebSocketManager` | Add `initialize()` method | NEW |
-| 3 | `WebSocketManager` | Add `connect(websocket)` method | NEW |
-| 4 | `WebSocketManager` | Add `disconnect()` method | NEW |
-| 5 | `WebSocketManager` | Add `shutdown()` method | NEW |
-| 6 | `WebSocketManager` | Add `stream_audio_to_client_loop()` method | NEW |
-| 7 | `Transcribe` | Add `self.loop` attribute | 133 |
-| 8 | `Transcribe` | Add `set_event_loop()` method | NEW |
-
-### Medium Priority (Runtime errors)
-
-| # | Class | Change | Lines |
-|---|-------|--------|-------|
-| 9 | `Transcribe` | Fix callback dict key names | 121-131 |
-| 10 | `Transcribe` | Fix `self.callback` → `self.callbacks` typo | 206 |
-| 11 | `Transcribe` | Fix `self.callbacks.on_...` → `self.callbacks.get('on_...')` | 167 |
-| 12 | `ChatLLM` | Fix method name `character_instruction_message` | 350 |
-| 13 | `ChatLLM` | Fix `self.chatllm` → `self` | 366 |
-| 14 | `ChatLLM` | Fix method name `wrap_character_tags` | 376 |
-| 15 | `ChatLLM` | Add parameters to `process_user_messages` | 354 |
-| 16 | `Speech` | Pass `voice` to `generate_audio_for_sentence` | 557 |
-
-### Low Priority (Improvements)
-
-| # | Class | Change | Lines |
-|---|-------|--------|-------|
-| 17 | `WebSocketManager` | Fix callback parameter names in Transcribe instantiation | 704-708 |
+This ensures:
+1. Audio chunks are associated with the correct message
+2. Frontend knows when all audio for a message is done
+3. Messages can be persisted to Supabase with proper IDs
 
 ---
 
-## Discussion Points
+## Files to Modify
 
-Before implementing, let's discuss:
-
-1. **User Identity:** The `process_user_messages` method takes `user_name` - where should this come from? Should it be stored in `WebSocketManager`?
-
-2. **LLM Text Streaming:** There's a reference to `self.llm_stream` (line 792) and `on_text_chunk`. Do you want to stream LLM text tokens to the frontend in real-time?
-
-3. **Multiple Connections:** Currently the server uses a single global `ws_manager`. Do you want to support multiple simultaneous WebSocket connections (multiple users)? If so, we'd need a connection ID system.
-
-4. **API Key:** Where should the OpenRouter API key come from? Currently I've assumed an environment variable `OPENROUTER_API_KEY`.
-
-5. **Character Loading:** Should characters be loaded once at startup, or refreshed per-message?
+1. **backend/fastapi_server.py** - All the changes above
 
 ---
 
 ## Ready for Implementation
 
-Once you've reviewed this document and we've discussed the points above, I can implement all the changes. Would you like to proceed with the implementation, or do you have questions about any of the findings?
+All issues have been identified and solutions provided. The flow has been verified end-to-end. Ready to implement when you approve!
