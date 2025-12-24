@@ -280,19 +280,13 @@ function setupEventListeners() {
     chatBtn.addEventListener('click', () => handleChatWithCharacter());
   }
 
-  // Voice tab - Method radio buttons
-  const cloneRadio = document.getElementById('voice-method-clone');
-  const profileRadio = document.getElementById('voice-method-profile');
-  if (cloneRadio && profileRadio) {
-    cloneRadio.addEventListener('change', handleVoiceMethodChange);
-    profileRadio.addEventListener('change', handleVoiceMethodChange);
-  }
-
   // Create Voice button
+  /* 
   const createVoiceBtn = document.getElementById('create-voice-btn');
   if (createVoiceBtn) {
     createVoiceBtn.addEventListener('click', handleCreateVoice);
   }
+  */
 }
 
 /**
@@ -560,6 +554,7 @@ function loadCharacterData(character) {
   }
 
   // Voice tab data
+  /*
   if (character.voiceData) {
     const cloneRadio = document.getElementById('voice-method-clone');
     const profileRadio = document.getElementById('voice-method-profile');
@@ -592,6 +587,7 @@ function loadCharacterData(character) {
     // Update disabled states based on method
     handleVoiceMethodChange();
   }
+  */
 }
 
 /**
@@ -653,14 +649,20 @@ function switchTab(tabName) {
   }
 
   // Initialize voice method state if switching to voice tab
+  /*
   if (tabName === 'voice') {
     handleVoiceMethodChange();
   }
+  */
 }
 
 /**
  * Handle voice method change (Clone vs Profile)
  */
+/**
+ * Handle voice method change (Clone vs Profile)
+ */
+/*
 function handleVoiceMethodChange() {
   const cloneRadio = document.getElementById('voice-method-clone');
   const profileRadio = document.getElementById('voice-method-profile');
@@ -690,10 +692,12 @@ function handleVoiceMethodChange() {
     textPath.classList.add('disabled');
   }
 }
+*/
 
 /**
  * Generate a voice name from character name
  */
+/*
 function generateVoiceName(characterName) {
   // Convert to lowercase, replace spaces with dashes, remove special chars
   const baseName = characterName
@@ -708,10 +712,12 @@ function generateVoiceName(characterName) {
   const timestamp = Date.now();
   return `${baseName}-voice-${timestamp}`;
 }
+*/
 
 /**
  * Handle Create Voice button click
  */
+/*
 async function handleCreateVoice() {
   const cloneRadio = document.getElementById('voice-method-clone');
   const speakerDesc = document.getElementById('voice-speaker-description');
@@ -797,6 +803,7 @@ async function handleCreateVoice() {
     }
   }
 }
+*/
 
 /**
  * Save character

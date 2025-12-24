@@ -52,24 +52,26 @@ logger.setLevel(logging.INFO)
 
 @dataclass
 class TTSSentence:
-    """Sentence queued for TTS synthesis"""
+    """Sentence queued for TTS synthesis with character context"""
     text: str
     index: int
-    message_id: str
+    session_id: str
     character_id: str
     character_name: str
     voice_id: str
     is_final: bool = False
+    is_session_complete: bool = False
 
 @dataclass
 class AudioChunk:
-    """PCM audio chunk ready for streaming"""
+    """PCM audio chunk ready for streaming with character context"""
     audio_bytes: bytes
     sentence_index: int
     chunk_index: int
-    message_id: str
+    session_id: str
     character_id: str
     is_final: bool = False
+    is_session_complete: bool = False
 
 @dataclass
 class ModelSettings:
@@ -115,11 +117,11 @@ class Transcribe:
         on_recording_start: Optional[Callback] = None,
         on_recording_stop: Optional[Callback] = None,
     ):
-        # Store callbacks with consistent key names
+
         self.callbacks: Dict[str, Optional[Callback]] = {
-            'on_transcription_update': on_transcription_update,
-            'on_transcription_stabilized': on_transcription_stabilized,
-            'on_transcription_finished': on_transcription_finished,
+            'on_realtime_update': on_transcription_update,
+            'on_realtime_stabilized': on_transcription_stabilized,
+            'on_final_transcription': on_transcription_finished,
             'on_vad_detect_start': on_vad_detect_start,
             'on_vad_detect_stop': on_vad_detect_stop,
             'on_vad_start': on_vad_start,
@@ -129,7 +131,6 @@ class Transcribe:
         }
 
         self.is_listening = False
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
 
         self.recorder = AudioToTextRecorder(
             model="small.en",
@@ -154,21 +155,17 @@ class Transcribe:
             use_microphone=False
         )
 
-    def set_event_loop(self, loop: asyncio.AbstractEventLoop):
-        """Set the asyncio event loop for callback execution"""
-        self.loop = loop
-
     def transcriber(self):
         """Transcribes in real-time from browser audio feed"""
 
         while self.is_listening:
             try:
+
                 user_message = self.recorder.text()
 
                 if user_message and user_message.strip():
-                    callback = self.callbacks.get('on_transcription_finished')
-                    if callback:
-                        self.run_callback(callback, user_message)
+                    if self.callbacks.on_transcription_finished:
+                        self.run_callback(self.callbacks.on_transcription_finished, user_message)
 
             except Exception as e:
                 logger.error(f"Error in recording loop: {e}")
@@ -206,7 +203,7 @@ class Transcribe:
 
     def _on_transcription_update(self, text: str) -> None:
         """RealtimeSTT callback: real-time transcription update."""
-        self.run_callback(self.callbacks.get('on_transcription_update'), text)
+        self.run_callback(self.callback.get('on_transcription_update'), text)
 
     def _on_transcription_stabilized(self, text: str) -> None:
         """RealtimeSTT callback: stabilized transcription."""
@@ -350,60 +347,44 @@ class ChatLLM:
         messages.extend(self.conversation_history)
 
         # Instruction for this character
-        messages.append(self.create_character_instruction_message(character))
+        messages.append(self.character_instruction_message(character))
 
         return messages
     
-    async def process_user_messages(
-        self,
-        user_message: str,
-        sentence_queue: asyncio.Queue,
-        on_text_chunk: Optional[Callable[[str, str], Awaitable[None]]] = None,
-    ):
-        """Process user message and generate character responses"""
+    async def process_user_messages(self, user_message: str, user_name: str,):
+            """Processes User Messages"""
+            
+            self.conversation_history.append({"role": "user", "name": user_name, "content": user_message})
 
-        # Add to local conversation history (no database call)
-        self.conversation_history.append({
-            "role": "user",
-            "name": "Jay",
-            "content": user_message
-        })
+            responding_characters = self.parse_character_mentions(message=user_message, active_characters=self.active_characters)
 
-        # Determine which characters respond
-        responding_characters = self.parse_character_mentions(
-            message=user_message,
-            active_characters=self.active_characters
-        )
+            for i, character in enumerate(responding_characters):
+                is_last = (i == len(responding_characters) - 1)
 
-        for i, character in enumerate(responding_characters):
-            message_id = str(uuid.uuid4())
+                messages = self.build_messages_for_character(character)
 
-            messages = self.build_messages_for_character(character)
+                full_response = await self.chatllm.stream_character_response(
+                    messages=messages,
+                    character=character,
+                    session_id=session_id, # remove (but don't want to break anything)
+                    model_settings=self.get_model_settings(),
+                    sentence_queue=sentence_queue,
+                    on_text_chunk=on_text_chunk,
+                    is_last_character=is_last
+                )
 
-            full_response = await self.stream_character_response(
-                messages=messages,
-                character=character,
-                message_id=message_id,
-                model_settings=self.get_model_settings(),
-                sentence_queue=sentence_queue,
-                on_text_chunk=on_text_chunk,
-            )
-
-            response_wrapped = self.wrap_with_character_tags(full_response, character.name)
-            self.conversation_history.append({
-                "role": "assistant",
-                "name": character.name,
-                "content": response_wrapped
-            })
+                response_wrapped = self.wrap_character_tags(full_response, character.name)
+                self.conversation_history.append({"role": "assistant", "name": character.name, "content": response_wrapped})
 
     async def stream_character_response(
         self,
         messages: List[Dict[str, str]],
         character: Character,
-        message_id: str,
+        session_id: str,
         model_settings: ModelSettings,
-        sentence_queue: asyncio.Queue,
-        on_text_chunk: Optional[Callable[[str, str], Awaitable[None]]] = None,
+        sentence_queue: asyncio.Queue[TTSSentence],
+        on_text_chunk: Optional[Callable[[str], Awaitable[None]]] = None,
+        is_last_character: bool = False
     ) -> str:
         """
         Stream LLM response for a character, extract sentences, queue for TTS.
@@ -437,7 +418,7 @@ class ChatLLM:
                         if content:
                             full_response += content
                             if on_text_chunk:
-                                await on_text_chunk(content, character.id)
+                                await on_text_chunk(content)
                             yield content
 
             async for sentence in generate_sentences_async(
@@ -453,11 +434,12 @@ class ChatLLM:
                     await sentence_queue.put(TTSSentence(
                         text=sentence_text,
                         index=sentence_index,
-                        message_id=message_id,
+                        session_id=session_id,
                         character_id=character.id,
                         character_name=character.name,
                         voice_id=character.voice,
                         is_final=False,
+                        is_session_complete=False
                     ))
                     logger.info(f"[LLM] {character.name} sentence {sentence_index}: {sentence_text[:50]}...")
                     sentence_index += 1
@@ -469,11 +451,12 @@ class ChatLLM:
         await sentence_queue.put(TTSSentence(
             text="",
             index=sentence_index,
-            message_id=message_id,
+            session_id=session_id,
             character_id=character.id,
             character_name=character.name,
             voice_id=character.voice,
             is_final=True,
+            is_session_complete=is_last_character
         ))
         logger.info(f"[LLM] {character.name} complete: {sentence_index} sentences")
 
@@ -557,9 +540,10 @@ class Speech:
                     audio_bytes=b"",
                     sentence_index=sentence.index,
                     chunk_index=0,
-                    message_id=sentence.message_id,
+                    session_id=sentence.session_id,
                     character_id=sentence.character_id,
                     is_final=True,
+                    is_session_complete=sentence.is_session_complete
                 ))
 
                 logger.info(f"[TTS] End sentinel passed through")
@@ -570,14 +554,15 @@ class Speech:
 
             chunk_index = 0
             try:
-                async for pcm_bytes in self.generate_audio_for_sentence(sentence.text, sentence.voice_id):
+                async for pcm_bytes in self.generate_audio_for_sentence(sentence.text):
                     audio_chunk = AudioChunk(
                         audio_bytes=pcm_bytes,
                         sentence_index=sentence.index,
                         chunk_index=chunk_index,
-                        message_id=sentence.message_id,
+                        session_id=sentence.session_id,
                         character_id=sentence.character_id,
                         is_final=False,
+                        is_session_complete=False
                     )
 
                     await self.queues.audio_queue.put(audio_chunk)
@@ -715,91 +700,12 @@ class WebSocketManager:
     """Manages WebSocket and Routes Messages"""
 
     def __init__(self):
-        # Pipeline queues - shared between all components
-        self.queues = PipeQueues()
 
-        # WebSocket connection
-        self.websocket: Optional[WebSocket] = None
-
-        # Pipeline components (initialized in initialize())
-        self.transcribe: Optional[Transcribe] = None
-        self.chat: Optional[ChatLLM] = None
-        self.speech: Optional[Speech] = None
-
-        # Background tasks
-        self.consumer_task: Optional[asyncio.Task] = None
-        self.audio_streamer_task: Optional[asyncio.Task] = None
-
-        # User info
-        self.user_name = "Jay"
-
-    async def initialize(self):
-        """Initialize all pipeline components at startup"""
-        api_key = os.getenv("OPENROUTER_API_KEY", "")
-
-        # Initialize transcription (STT)
         self.transcribe = Transcribe(
-            on_transcription_update=self.on_transcription_update,
-            on_transcription_stabilized=self.on_transcription_stabilized,
-            on_transcription_finished=self.on_transcription_finished,
+            on_realtime_update=self.on_transcription_update,
+            on_realtime_stabilized=self.on_transcription_stabilized,
+            on_final_transcription=self.on_transcription_finished,
         )
-        self.transcribe.set_event_loop(asyncio.get_event_loop())
-
-        # Initialize chat (LLM)
-        self.chat = ChatLLM(queues=self.queues, api_key=api_key)
-        self.chat.active_characters = await self.chat.get_active_characters()
-
-        # Initialize speech (TTS)
-        self.speech = Speech(queues=self.queues)
-        await self.speech.initialize()
-
-        logger.info(f"Initialized with {len(self.chat.active_characters)} active characters")
-
-    async def connect(self, websocket: WebSocket):
-        """Accept WebSocket connection and start pipeline"""
-        await websocket.accept()
-        self.websocket = websocket
-
-        # Start TTS worker
-        await self.speech.start()
-
-        # Start pipeline consumer
-        await self.start_pipeline()
-
-        # Start audio streaming to client
-        self.audio_streamer_task = asyncio.create_task(self.stream_audio_loop())
-
-        logger.info("WebSocket connected, pipeline started")
-
-    async def disconnect(self):
-        """Clean up on disconnect"""
-        if self.transcribe:
-            self.transcribe.stop_listening()
-
-        if self.speech:
-            await self.speech.stop()
-
-        if self.consumer_task:
-            self.consumer_task.cancel()
-            try:
-                await self.consumer_task
-            except asyncio.CancelledError:
-                pass
-
-        if self.audio_streamer_task:
-            self.audio_streamer_task.cancel()
-            try:
-                await self.audio_streamer_task
-            except asyncio.CancelledError:
-                pass
-
-        self.websocket = None
-        logger.info("WebSocket disconnected, pipeline stopped")
-
-    async def shutdown(self):
-        """Shutdown all services"""
-        await self.disconnect()
-        logger.info("All services shut down")
 
     async def handle_text_message(self, message: str):
         """Handle incoming text messages from WebSocket client"""
@@ -836,14 +742,6 @@ class WebSocketManager:
                     self.chat.set_model_settings(model_settings)
                 logger.info(f"Model settings updated: {model_settings.model}")
 
-            elif message_type == "refresh_characters":
-                await self.refresh_active_characters()
-
-            elif message_type == "clear_history":
-                if self.chat:
-                    self.chat.clear_conversation_history()
-                await self.send_text_to_client({"type": "history_cleared"})
-
         except Exception as e:
             logger.error(f"Error handling message: {e}", exc_info=True)
 
@@ -860,30 +758,21 @@ class WebSocketManager:
         """Send JSON message to client"""
         if self.websocket:
             await self.websocket.send_text(json.dumps(data))
+    
+    async def stream_audio_to_client(self, audio_bytes: bytes):
+        """Send binary audio to client (TTS)"""
+        if self.websocket:
+            await self.websocket.send_bytes(audio_bytes)
 
     async def on_transcription_update(self, text: str):
         await self.send_text_to_client({"type": "stt_update", "text": text})
-
+    
     async def on_transcription_stabilized(self, text: str):
         await self.send_text_to_client({"type": "stt_stabilized", "text": text})
-
+    
     async def on_transcription_finished(self, user_message: str):
         await self.queues.transcribe_queue.put(user_message)
         await self.send_text_to_client({"type": "stt_finished", "text": user_message})
-
-    async def on_llm_text_chunk(self, text_chunk: str, character_id: str):
-        """Stream LLM text chunks to frontend in real-time"""
-        await self.send_text_to_client({
-            "type": "llm_chunk",
-            "text": text_chunk,
-            "character_id": character_id
-        })
-
-    async def refresh_active_characters(self):
-        """Refresh active characters from database (call when characters change)"""
-        if self.chat:
-            self.chat.active_characters = await self.chat.get_active_characters()
-            logger.info(f"Refreshed to {len(self.chat.active_characters)} active characters")
 
     async def start_pipeline(self):
         """Start the voice transcription → LLM → TTS pipeline as a background task"""
@@ -891,41 +780,19 @@ class WebSocketManager:
 
     async def get_user_messages(self):
         """Background task: get user message from transcribe queue and process."""
+
         while True:
-            try:
-                user_message: str = await self.queues.transcribe_queue.get()
+            user_message: str = await self.queues.transcribe_queue.get()
 
-                if user_message and user_message.strip():
-                    await self.chat.process_user_messages(
-                        user_message=user_message,
-                        sentence_queue=self.queues.sentence_queue,
-                        on_text_chunk=self.on_llm_text_chunk,
-                    )
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error processing user message: {e}")
-
-    async def stream_audio_loop(self):
-        """Background task: stream audio chunks to WebSocket client"""
-        while True:
-            try:
-                chunk: AudioChunk = await self.queues.audio_queue.get()
-
-                if chunk.audio_bytes:
-                    await self.websocket.send_bytes(chunk.audio_bytes)
-
-                if chunk.is_final:
-                    await self.send_text_to_client({
-                        "type": "audio_complete",
-                        "message_id": chunk.message_id,
-                        "character_id": chunk.character_id
-                    })
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error streaming audio: {e}")
+            if user_message and user_message.strip():
+                session_id = str(uuid.uuid4())
+                
+                await self.chat.process_user_message(
+                    user_message=user_message,
+                    llm_stream=self.llm_stream,
+                    sentence_queue=self.queues.sentence_queue,
+                    session_id=session_id
+                )
 
 ########################################
 ##--           FastAPI App          --##

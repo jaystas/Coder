@@ -80,7 +80,7 @@ function handleServerMessage(message) {
       finalizeUserMessage(message.text)
       break
 
-    case 'response_chunk':
+    case 'text_chunk':
       handleResponseChunk(message.data)
       break
   }

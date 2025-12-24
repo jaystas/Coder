@@ -4,7 +4,7 @@
     "messages": [
       {
         "role": "system",
-        "content": "This is the main system prompt. It is sent once at the beginning of the conversation. Included in conversation history, stays up top."
+        "content": "This is the main system prompt. It is sent once at the beginning of the conversation - stays up top."
       },
       {
         "role": "user",
