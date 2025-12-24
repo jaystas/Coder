@@ -83,6 +83,10 @@ function handleServerMessage(message) {
     case 'text_chunk':
       handleResponseChunk(message.data)
       break
+
+    case 'audio_complete':
+      handleAudioComplete(message)
+      break
   }
 }
 
@@ -124,6 +128,16 @@ function handleResponseChunk(data) {
     state.currentMessageId = null
     scrollToBottom()
   }
+}
+
+/**
+ * Handle audio complete notification
+ * @param {object} data - {message_id, character_id}
+ */
+function handleAudioComplete(data) {
+  const { message_id, character_id } = data
+  console.log(`[Chat] Audio complete for message ${message_id} from character ${character_id}`)
+  // Optional: Add visual indicator that audio is ready/complete
 }
 
 // ============================================

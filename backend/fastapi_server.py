@@ -437,7 +437,7 @@ class ChatLLM:
                         if content:
                             full_response += content
                             if on_text_chunk:
-                                await on_text_chunk(content, character.id)
+                                await on_text_chunk(content, character.id, character.name, message_id)
                             yield content
 
             async for sentence in generate_sentences_async(
@@ -476,6 +476,10 @@ class ChatLLM:
             is_final=True,
         ))
         logger.info(f"[LLM] {character.name} complete: {sentence_index} sentences")
+
+        # Send final chunk notification to frontend
+        if on_text_chunk:
+            await on_text_chunk("", character.id, character.name, message_id, is_final=True)
 
         return full_response
 
@@ -869,14 +873,25 @@ class WebSocketManager:
 
     async def on_transcription_finished(self, user_message: str):
         await self.queues.transcribe_queue.put(user_message)
-        await self.send_text_to_client({"type": "stt_finished", "text": user_message})
+        await self.send_text_to_client({"type": "stt_final", "text": user_message})
 
-    async def on_llm_text_chunk(self, text_chunk: str, character_id: str):
+    async def on_llm_text_chunk(
+        self,
+        text_chunk: str,
+        character_id: str,
+        character_name: str,
+        message_id: str,
+        is_final: bool = False
+    ):
         """Stream LLM text chunks to frontend in real-time"""
         await self.send_text_to_client({
-            "type": "llm_chunk",
-            "text": text_chunk,
-            "character_id": character_id
+            "type": "text_chunk",
+            "data": {
+                "text": text_chunk,
+                "character_name": character_name,
+                "message_id": message_id,
+                "is_final": is_final
+            }
         })
 
     async def refresh_active_characters(self):
