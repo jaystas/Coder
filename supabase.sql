@@ -68,9 +68,7 @@ create table public.messages (
 ) TABLESPACE pg_default;
 
 create index IF not exists idx_messages_conversation_id on public.messages using btree (conversation_id) TABLESPACE pg_default;
-
 create index IF not exists idx_messages_character_name on public.messages using btree (name) TABLESPACE pg_default;
-
 create index IF not exists idx_messages_created_at on public.messages using btree (created_at) TABLESPACE pg_default;
 
 create trigger update_messages_updated_at BEFORE
