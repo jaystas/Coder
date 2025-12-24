@@ -1,15 +1,16 @@
-# FastAPI Server Review & Planning Document (Updated)
+# FastAPI Server Review & Planning Document (v3 - Simplified)
 
 ## Executive Summary
 
 The server implements a voice chat pipeline: **STT (Transcribe) → LLM (ChatLLM) → TTS (Speech)**
 
-This document reflects the updated requirements:
+**Requirements:**
 - Single user: "Jay"
 - Single WebSocket connection
 - Stream LLM text tokens to frontend in real-time
 - Characters loaded at startup, refreshed when changed
-- Use `conversation_id` and `message_id` (not session_id)
+- **Zero database calls during response flow** (latency critical!)
+- `message_id` generated locally via `uuid.uuid4()` for audio tracking
 
 ---
 
@@ -36,76 +37,54 @@ This document reflects the updated requirements:
 
 ---
 
-## Data Flow with message_id
+## Simplified `message_id` Approach
 
-The key insight: **Each character's response is ONE message with a unique `message_id`**
+**No database calls during response!** Just generate a UUID locally:
 
+```python
+message_id = str(uuid.uuid4())  # Instant, no latency
 ```
-User speaks/types
-       │
-       ▼
-┌─────────────────┐
-│   Transcribe    │ → transcribe_queue (user text)
-└─────────────────┘
-       │
-       ▼
-┌─────────────────┐
-│    ChatLLM      │ For each responding character:
-│                 │   1. Create Message in Supabase → get message_id
-│                 │   2. Stream LLM response
-│                 │   3. Extract sentences → TTSSentence (with message_id)
-│                 │   4. Stream text chunks to frontend
-└─────────────────┘
-       │
-       ▼ sentence_queue
-┌─────────────────┐
-│     Speech      │ For each TTSSentence:
-│     (TTS)       │   1. Generate audio chunks
-│                 │   2. Each AudioChunk carries message_id
-└─────────────────┘
-       │
-       ▼ audio_queue
-┌─────────────────┐
-│  WebSocket      │ Stream to frontend:
-│  (to client)    │   - Binary audio (tagged with message_id)
-│                 │   - is_final=True signals end of this message's audio
-└─────────────────┘
-```
+
+The `message_id` is purely for:
+1. Tracking which audio chunks belong to which character response
+2. Letting frontend know when audio for a response is complete
+
+Database persistence (if needed later) can happen asynchronously after the response is complete.
 
 ---
 
 ## Updated Dataclasses
 
-### `TTSSentence` - UPDATED
+### `TTSSentence` - SIMPLIFIED
 ```python
 @dataclass
 class TTSSentence:
-    """Sentence queued for TTS synthesis with character context"""
+    """Sentence queued for TTS synthesis"""
     text: str
     index: int                    # Sentence index within this message
-    conversation_id: str          # CHANGED: was session_id
-    message_id: str               # NEW: Supabase message ID
+    message_id: str               # Local UUID for tracking
     character_id: str
     character_name: str
     voice_id: str
     is_final: bool = False        # True = last sentence for this message
-    # REMOVED: is_session_complete (not needed)
 ```
 
-### `AudioChunk` - UPDATED
+**Removed:** `session_id`, `conversation_id`, `is_session_complete`
+
+### `AudioChunk` - SIMPLIFIED
 ```python
 @dataclass
 class AudioChunk:
-    """PCM audio chunk ready for streaming with character context"""
+    """PCM audio chunk ready for streaming"""
     audio_bytes: bytes
     sentence_index: int
     chunk_index: int
-    conversation_id: str          # CHANGED: was session_id
-    message_id: str               # NEW: for tracking which message this audio belongs to
+    message_id: str               # Local UUID for tracking
     character_id: str
     is_final: bool = False        # True = last chunk for this message
-    # REMOVED: is_session_complete (not needed)
 ```
+
+**Removed:** `session_id`, `conversation_id`, `is_session_complete`
 
 ### `ModelSettings` - NO CHANGES
 ```python
@@ -139,7 +118,7 @@ class PipeQueues:
 
 ### 2. `Transcribe` (Lines 106-238) - FIXES REQUIRED
 
-**Current Issues:**
+**Issues:**
 | Line | Issue | Fix |
 |------|-------|-----|
 | 121-131 | Callback dict keys mismatch | Use consistent key names |
@@ -190,16 +169,16 @@ def set_event_loop(self, loop: asyncio.AbstractEventLoop):
 
 ### 3. `ChatLLM` (Lines 245-463) - FIXES REQUIRED
 
-**`__init__` is good, but needs db reference:**
+**`__init__` - Minor addition:**
 ```python
 def __init__(self, queues: PipeQueues, api_key: str):
     self.conversation_history: List[Dict] = []
-    self.conversation_id: Optional[str] = None
     self.queues = queues
     self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
     self.model_settings: Optional[ModelSettings] = None
     self.active_characters: List[Character] = []
-    self.db = db  # ADD: reference to database director
+    # REMOVED: self.conversation_id (not needed for now)
+    # REMOVED: self.db (no database calls during response)
 ```
 
 **Method fixes:**
@@ -210,25 +189,17 @@ def __init__(self, queues: PipeQueues, api_key: str):
 | 366 | Wrong self reference | `self.chatllm.stream_...` → `self.stream_...` |
 | 376 | Wrong method name | `wrap_character_tags` → `wrap_with_character_tags` |
 
-**Updated `process_user_messages`:**
+**Updated `process_user_messages` - NO DATABASE CALLS:**
 ```python
 async def process_user_messages(
     self,
     user_message: str,
     sentence_queue: asyncio.Queue[TTSSentence],
-    on_text_chunk: Optional[Callable[[str, str], Awaitable[None]]] = None,  # (chunk, character_id)
+    on_text_chunk: Optional[Callable[[str, str], Awaitable[None]]] = None,
 ):
     """Process user message and generate character responses"""
 
-    # Save user message to database
-    user_msg = await self.db.create_message(MessageCreate(
-        conversation_id=self.conversation_id,
-        role="user",
-        content=user_message,
-        name="Jay"
-    ))
-
-    # Add to conversation history
+    # Add to local conversation history (no database call)
     self.conversation_history.append({
         "role": "user",
         "name": "Jay",
@@ -244,30 +215,19 @@ async def process_user_messages(
     for i, character in enumerate(responding_characters):
         is_last = (i == len(responding_characters) - 1)
 
-        # Create message in Supabase FIRST to get message_id
-        char_msg = await self.db.create_message(MessageCreate(
-            conversation_id=self.conversation_id,
-            role="assistant",
-            content="",  # Will update after streaming completes
-            name=character.name,
-            character_id=character.id
-        ))
+        # Generate message_id locally - INSTANT, no latency!
+        message_id = str(uuid.uuid4())
 
         messages = self.build_messages_for_character(character)
 
         full_response = await self.stream_character_response(
             messages=messages,
             character=character,
-            conversation_id=self.conversation_id,
-            message_id=char_msg.message_id,  # Pass the message_id
+            message_id=message_id,
             model_settings=self.get_model_settings(),
             sentence_queue=sentence_queue,
             on_text_chunk=on_text_chunk,
-            is_last_character=is_last
         )
-
-        # Update message with full response (for persistence)
-        # Note: Could also do this via update_message if needed
 
         response_wrapped = self.wrap_with_character_tags(full_response, character.name)
         self.conversation_history.append({
@@ -283,43 +243,79 @@ async def stream_character_response(
     self,
     messages: List[Dict[str, str]],
     character: Character,
-    conversation_id: str,           # CHANGED from session_id
-    message_id: str,                # NEW
+    message_id: str,
     model_settings: ModelSettings,
     sentence_queue: asyncio.Queue[TTSSentence],
     on_text_chunk: Optional[Callable[[str, str], Awaitable[None]]] = None,
-    is_last_character: bool = False
 ) -> str:
     """Stream LLM response, extract sentences, queue for TTS."""
 
     sentence_index = 0
     full_response = ""
 
-    # ... streaming logic ...
+    try:
+        stream = await self.client.chat.completions.create(
+            model=model_settings.model,
+            messages=messages,
+            temperature=model_settings.temperature,
+            top_p=model_settings.top_p,
+            frequency_penalty=model_settings.frequency_penalty,
+            presence_penalty=model_settings.presence_penalty,
+            stream=True,
+            extra_body={
+                "top_k": model_settings.top_k,
+                "min_p": model_settings.min_p,
+                "repetition_penalty": model_settings.repetition_penalty,
+            }
+        )
 
-    # When queueing sentences:
-    await sentence_queue.put(TTSSentence(
-        text=sentence_text,
-        index=sentence_index,
-        conversation_id=conversation_id,
-        message_id=message_id,        # NEW
-        character_id=character.id,
-        character_name=character.name,
-        voice_id=character.voice,
-        is_final=False,
-    ))
+        async def chunk_generator() -> AsyncGenerator[str, None]:
+            nonlocal full_response
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        full_response += content
+                        if on_text_chunk:
+                            await on_text_chunk(content, character.id)
+                        yield content
 
-    # Final sentinel:
+        async for sentence in generate_sentences_async(
+            chunk_generator(),
+            minimum_first_fragment_length=10,
+            minimum_sentence_length=15,
+            quick_yield_single_sentence_fragment=True,
+            sentence_fragment_delimiters=".?!;:,\n…)]}。-",
+            full_sentence_delimiters=".?!\n…。",
+        ):
+            sentence_text = sentence.strip()
+            if sentence_text:
+                await sentence_queue.put(TTSSentence(
+                    text=sentence_text,
+                    index=sentence_index,
+                    message_id=message_id,
+                    character_id=character.id,
+                    character_name=character.name,
+                    voice_id=character.voice,
+                    is_final=False,
+                ))
+                sentence_index += 1
+
+    except Exception as e:
+        logger.error(f"[LLM] Error streaming for {character.name}: {e}")
+
+    # Final sentinel
     await sentence_queue.put(TTSSentence(
         text="",
         index=sentence_index,
-        conversation_id=conversation_id,
         message_id=message_id,
         character_id=character.id,
         character_name=character.name,
         voice_id=character.voice,
         is_final=True,
     ))
+
+    return full_response
 ```
 
 ---
@@ -337,17 +333,29 @@ async for pcm_bytes in self.generate_audio_for_sentence(sentence.text):
 async for pcm_bytes in self.generate_audio_for_sentence(sentence.text, sentence.voice_id):
 ```
 
-**Update AudioChunk creation:**
+**Update AudioChunk creation to use simplified dataclass:**
 ```python
 audio_chunk = AudioChunk(
     audio_bytes=pcm_bytes,
     sentence_index=sentence.index,
     chunk_index=chunk_index,
-    conversation_id=sentence.conversation_id,  # CHANGED
-    message_id=sentence.message_id,            # NEW
+    message_id=sentence.message_id,
     character_id=sentence.character_id,
     is_final=False,
 )
+```
+
+**Update sentinel passthrough:**
+```python
+if sentence.is_final:
+    await self.queues.audio_queue.put(AudioChunk(
+        audio_bytes=b"",
+        sentence_index=sentence.index,
+        chunk_index=0,
+        message_id=sentence.message_id,
+        character_id=sentence.character_id,
+        is_final=True,
+    ))
 ```
 
 ---
@@ -465,13 +473,9 @@ async def stream_audio_loop(self):
             chunk: AudioChunk = await self.queues.audio_queue.get()
 
             if chunk.audio_bytes:
-                # Send binary audio with metadata header
-                # Format: 1 byte flags + message_id + audio
-                # Or send metadata via text message first
                 await self.websocket.send_bytes(chunk.audio_bytes)
 
             if chunk.is_final:
-                # Notify frontend this message's audio is complete
                 await self.send_text_to_client({
                     "type": "audio_complete",
                     "message_id": chunk.message_id,
@@ -546,54 +550,36 @@ async def handle_text_message(self, message: str):
                 self.transcribe.stop_listening()
 
         elif message_type == "model_settings":
-            # ... existing code ...
+            settings_data = payload
+            model_settings = ModelSettings(
+                model=settings_data.get("model", "meta-llama/llama-3.1-8b-instruct"),
+                temperature=float(settings_data.get("temperature", 0.7)),
+                top_p=float(settings_data.get("top_p", 0.9)),
+                min_p=float(settings_data.get("min_p", 0.0)),
+                top_k=int(settings_data.get("top_k", 40)),
+                frequency_penalty=float(settings_data.get("frequency_penalty", 0.0)),
+                presence_penalty=float(settings_data.get("presence_penalty", 0.0)),
+                repetition_penalty=float(settings_data.get("repetition_penalty", 1.0))
+            )
+            if self.chat:
+                self.chat.set_model_settings(model_settings)
+            logger.info(f"Model settings updated: {model_settings.model}")
 
         elif message_type == "refresh_characters":
-            # NEW: Refresh active characters when frontend notifies of change
             await self.refresh_active_characters()
 
-        elif message_type == "new_conversation":
-            # NEW: Start a new conversation
-            await self.start_new_conversation()
+        elif message_type == "clear_history":
+            if self.chat:
+                self.chat.clear_conversation_history()
+            await self.send_text_to_client({"type": "history_cleared"})
 
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
 ```
 
-**Add `start_new_conversation()` method:**
-```python
-async def start_new_conversation(self):
-    """Start a new conversation"""
-    if self.chat:
-        # Create conversation in Supabase
-        from backend.database_director import db, ConversationCreate
-
-        # Get active character data for storage
-        active_char_data = [
-            {"id": c.id, "name": c.name}
-            for c in self.chat.active_characters
-        ]
-
-        conversation = await db.create_conversation(
-            ConversationCreate(active_characters=active_char_data)
-        )
-
-        self.chat.conversation_id = conversation.conversation_id
-        self.chat.clear_conversation_history()
-
-        await self.send_text_to_client({
-            "type": "conversation_started",
-            "conversation_id": conversation.conversation_id
-        })
-
-        logger.info(f"Started new conversation: {conversation.conversation_id}")
-```
-
 ---
 
-## Complete End-to-End Flow
-
-Here's the verified flow from user input to audio output:
+## Complete End-to-End Flow (No Database Calls!)
 
 ### 1. User Speaks (STT Path)
 ```
@@ -613,14 +599,14 @@ Browser text input → WebSocket JSON {"type": "user_message", "data": {"text": 
     → queues.transcribe_queue.put(user_message)
 ```
 
-### 3. Message Processing (LLM)
+### 3. Message Processing (LLM) - ZERO DB CALLS
 ```
 get_user_messages() loop:
     → queues.transcribe_queue.get()
     → chat.process_user_messages()
-        → db.create_message() for user message
+        → conversation_history.append(user_message)  # Local only
         → For each character:
-            → db.create_message() → get message_id
+            → message_id = uuid.uuid4()  # INSTANT!
             → stream_character_response()
                 → OpenRouter streaming API
                 → For each text chunk:
@@ -634,7 +620,7 @@ get_user_messages() loop:
 ```
 speech.process_sentences() loop:
     → sentence_queue.get()
-    → If is_final: pass through sentinel
+    → If is_final: pass through sentinel to audio_queue
     → Else: generate_audio_for_sentence()
         → Higgs Audio streaming
         → For each PCM chunk:
@@ -652,20 +638,16 @@ stream_audio_loop():
 
 ---
 
-## Message ID Tracking Summary
+## Summary of Changes
 
-| Stage | Where message_id comes from |
-|-------|----------------------------|
-| User message | `db.create_message()` returns `message_id` (can use for future features) |
-| Character response | `db.create_message()` returns `message_id` BEFORE streaming starts |
-| TTSSentence | Carries `message_id` from ChatLLM |
-| AudioChunk | Carries `message_id` from TTSSentence |
-| Frontend | Receives `message_id` in `audio_complete` event, can match to UI |
-
-This ensures:
-1. Audio chunks are associated with the correct message
-2. Frontend knows when all audio for a message is done
-3. Messages can be persisted to Supabase with proper IDs
+| Component | Change |
+|-----------|--------|
+| `TTSSentence` | Simplified: removed `session_id`, `conversation_id`, `is_session_complete` |
+| `AudioChunk` | Simplified: removed `session_id`, `conversation_id`, `is_session_complete` |
+| `Transcribe` | Fix callback keys, add `self.loop`, fix typos |
+| `ChatLLM` | Remove DB calls, generate `message_id` locally, fix method names |
+| `Speech` | Pass `voice_id` to generator, update dataclass usage |
+| `WebSocketManager` | Add all missing methods and attributes |
 
 ---
 
@@ -677,4 +659,4 @@ This ensures:
 
 ## Ready for Implementation
 
-All issues have been identified and solutions provided. The flow has been verified end-to-end. Ready to implement when you approve!
+All changes are latency-friendly with zero database calls during the response flow. Ready to implement when you approve!
