@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
 
 from backend.RealtimeSTT import AudioToTextRecorder
-from backend.stream2sentence import generate_sentences_async
+from backend.stream2sentence import generate_sentences_async, initialize_nltk
 from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
 from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioContent, TextContent
 from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
@@ -197,11 +197,15 @@ class Transcribe:
     def start_listening(self):
         """Start listening for audio input"""
         self.is_listening = True
+        if self.recorder:
+            self.recorder.start()
         logger.info("Started listening for audio")
 
     def stop_listening(self):
         """Stop listening for audio input"""
         self.is_listening = False
+        if self.recorder:
+            self.recorder.stop()
         logger.info("Stopped listening for audio")
 
     def _on_transcription_update(self, text: str) -> None:
@@ -951,6 +955,11 @@ ws_manager = WebSocketManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Starting up services...")
+
+    # Initialize NLTK tokenizer for sentence generation
+    print("Initializing NLTK tokenizer...")
+    initialize_nltk()
+
     await ws_manager.initialize()
     print("All services initialized!")
     yield
