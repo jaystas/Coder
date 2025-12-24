@@ -27,23 +27,33 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 @dataclass
+class TextChunk:
+  """Text for streaming to client UI display"""
+  text: str
+  message_id: str
+  character_id: str
+  character_name: str
+
+@dataclass
 class TTSSentence:
     """Sentence queued for TTS synthesis"""
-    text: str
-    index: int
-    session_id: str
-    is_final: bool = False
-
+  text: str
+  message_id: str
+  index: int
+  character_id: str
+  character_name: str
+  voice_id: str
+  is_final: bool = False
 
 @dataclass
 class AudioChunk:
-    """PCM audio chunk ready for streaming"""
-    audio_data: bytes
-    sentence_index: int
-    chunk_index: int
-    session_id: str
-    is_final: bool = False
-
+  """PCM audio chunk ready for streaming"""
+  audio_bytes: bytes
+  message_id: str
+  index: int
+  character_id: str
+  character_name: str
+  is_final: bool = False
 
 # ============================================================================
 # Queue Manager
@@ -497,4 +507,5 @@ class StreamingPipeline:
             return full_response
 
         finally:
+
             await self.audio_streamer.stop()
